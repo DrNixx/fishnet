@@ -1,5 +1,5 @@
-fishnet: distributed Stockfish analysis for lichess.org
-=======================================================
+fishnet: distributed Stockfish analysis for lichess.org & chess-online.com
+==========================================================================
 
 .. image:: https://badge.fury.io/py/fishnet.svg
     :target: https://pypi.python.org/pypi/fishnet

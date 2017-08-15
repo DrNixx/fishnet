@@ -27,6 +27,7 @@ class WorkerTest(unittest.TestCase):
         conf = configparser.ConfigParser()
         conf.add_section("Fishnet")
         conf.set("Fishnet", "Key", "testkey")
+        conf.set("Fishnet", "MongoDB", "mongodb://localhost:27017/")
 
         fishnet.get_stockfish_command(conf, update=True)
 
@@ -66,6 +67,34 @@ class WorkerTest(unittest.TestCase):
             "variant": "standard",
             "position": STARTPOS,
             "moves": "f2f3 e7e6 g2g4 d8h4",
+        }
+
+        response = self.worker.analysis(job)
+        result = response["analysis"]
+
+        self.assertTrue(0 <= result[0]["score"]["cp"] <= 90)
+
+        self.assertEqual(result[3]["score"]["mate"], 1)
+        self.assertTrue(result[3]["pv"].startswith("d8h4"))
+
+        self.assertEqual(result[4]["score"]["mate"], 0)
+
+    def test_fen(self):
+        job = {
+            "work": {
+                "type": "analysis",
+                "id": "12345678",
+            },
+            "game_id": "87654321",
+            "variant": "standard",
+            "position": STARTPOS,
+            "moves": "f2f3 e7e6 g2g4 d8h4",
+            "fens": [
+                "rnbqkbnr/pppppppp/8/8/8/5P2/PPPPP1PP/RNBQKBNR b KQkq -", 
+                "rnbqkbnr/pppp1ppp/4p3/8/8/5P2/PPPPP1PP/RNBQKBNR w KQkq -", 
+                "rnbqkbnr/pppp1ppp/4p3/8/6P1/5P2/PPPPP2P/RNBQKBNR b KQkq -", 
+                "rnb1kbnr/pppp1ppp/4p3/8/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq -", 
+            ]
         }
 
         response = self.worker.analysis(job)

@@ -17,7 +17,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-"""Distributed Stockfish analysis for lichess.org"""
+"""Distributed Stockfish analysis for lichess.org & chess-online.com"""
 
 from __future__ import print_function
 from __future__ import division
@@ -48,6 +48,14 @@ try:
 except ImportError:
     print("fishnet requires the 'requests' module.", file=sys.stderr)
     print("Try 'pip install requests' or install python-requests from your distro packages.", file=sys.stderr)
+    print(file=sys.stderr)
+    raise
+
+try:
+    from pymongo import MongoClient
+except ImportError:
+    print("fishnet use the 'pymongo' module.", file=sys.stderr)
+    print("Try 'pip install pymongo' or install python-pymongo from your distro packages if you need evaluation cache.", file=sys.stderr)
     print(file=sys.stderr)
     raise
 
@@ -93,7 +101,8 @@ __author__ = "Niklas Fiekas"
 __email__ = "niklas.fiekas@backscattering.de"
 __license__ = "GPLv3+"
 
-DEFAULT_ENDPOINT = "https://lichess.org/fishnet/"
+DEFAULT_HOST = "www.chess-online.com"
+DEFAULT_ENDPOINT = "https://" + DEFAULT_HOST + "/fishnet/"
 STOCKFISH_RELEASES = "https://api.github.com/repos/niklasf/Stockfish/releases/latest"
 DEFAULT_THREADS = 3
 HASH_MIN = 16
@@ -121,7 +130,7 @@ def intro():
 .        `\_   ===    \.  |     |  _| | \__ \ | | | |\  |  __/ |_
 .        / /\_   \ /      |     |_|   |_|___/_| |_|_| \_|\___|\__| %s
 .        |/   \_  \|      /
-.               \________/      Distributed Stockfish analysis for lichess.org
+.               \________/      Distributed Stockfish analysis for lichess.org & chess-online.com
 """.lstrip() % __version__
 
 
@@ -411,7 +420,10 @@ def setoption(p, name, value):
 
 
 def go(p, position, moves, movetime=None, clock=None, depth=None, nodes=None):
-    send(p, "position fen %s moves %s" % (position, " ".join(moves)))
+    cmd = "position fen %s" % (position)
+    if moves is not None:
+        cmd += " moves %s" % (" ".join(moves))
+    send(p, cmd)
     isready(p)
 
     builder = []
@@ -580,6 +592,10 @@ class Worker(threading.Thread):
 
         self.job = None
         self.backoff = start_backoff(self.conf)
+        self.analysis_nodes = get_nodes(self.conf)
+        self.analysis_movetime = get_movetime(self.conf)
+
+        self.mongo = get_mongo_collection(self.conf)
 
     def stop(self):
         with self.status_lock:
@@ -761,6 +777,27 @@ class Worker(threading.Thread):
 
             return "acquire", result
 
+    def get_cache(self, fen):
+        part = None
+        if self.mongo is not None:
+            eval = self.mongo.find_one({"_id": fen})
+            if eval is not None:
+                part = eval.get("p")
+                self.mongo.update_one({"_id": fen}, {'$inc': {'h': 1}})
+
+        return part
+
+    def set_cache(self, fen, part):
+        if self.mongo is not None:
+            result = self.mongo.update_one({"_id": fen}, {'$set': {'p': part}})
+            if result.matched_count == 0:
+                self.mongo.insert_one({
+                    "_id": fen,
+                    "p": part,
+                    "h": 1
+                })
+
+
     def bestmove(self, job):
         lvl = job["work"]["level"]
         variant = job.get("variant", "standard")
@@ -798,6 +835,7 @@ class Worker(threading.Thread):
     def analysis(self, job):
         variant = job.get("variant", "standard")
         moves = job["moves"].split(" ")
+        fens = job.get("fens")
 
         result = self.make_request()
         result["analysis"] = [None for _ in range(len(moves) + 1)]
@@ -810,7 +848,13 @@ class Worker(threading.Thread):
         send(self.stockfish, "ucinewgame")
         isready(self.stockfish)
 
-        nodes = job.get("nodes") or 3500000
+        nodes = job.get("nodes") or self.analysis_nodes
+        movetime = job.get("movetime") or self.analysis_movetime
+        if (movetime == -1):
+            movetime=None
+
+        if fens is not None:
+            fens.insert(0, job["position"])
 
         for ply in range(len(moves), -1, -1):
             if last_progress_report + PROGRESS_REPORT_INTERVAL < time.time():
@@ -822,8 +866,14 @@ class Worker(threading.Thread):
                         variant,
                         base_url(get_endpoint(self.conf)), job["game_id"], ply)
 
-            part = go(self.stockfish, job["position"], moves[0:ply],
-                      nodes=nodes, movetime=4000)
+            if fens is None:
+                part = go(self.stockfish, job["position"], moves[0:ply], 
+                    nodes=nodes, movetime=movetime)
+            else:
+                part = self.get_cache(fens[ply])
+                if part is None:
+                    part = go(self.stockfish, fens[ply], None, 
+                        nodes=nodes, movetime=movetime)
 
             if "mate" not in part["score"] and "time" in part and part["time"] < 100:
                 logging.warning("Very low time reported: %d ms.", part["time"])
@@ -831,6 +881,9 @@ class Worker(threading.Thread):
             if "nps" in part and part["nps"] >= 100000000:
                 logging.warning("Dropping exorbitant nps: %d", part["nps"])
                 del part["nps"]
+
+            if fens is not None:
+                self.set_cache(fens[ply], part)
 
             self.nodes += part.get("nodes", 0)
             self.positions += 1
@@ -1111,6 +1164,10 @@ def load_conf(args):
         conf.set("Fishnet", "Key", args.key)
     if hasattr(args, "cores") and args.cores is not None:
         conf.set("Fishnet", "Cores", args.cores)
+    if hasattr(args, "nodes") and args.nodes is not None:
+        conf.set("Fishnet", "Nodes", args.nodes)
+    if hasattr(args, "movetime") and args.movetime is not None:
+        conf.set("Fishnet", "MoveTime", args.movetime)
     if hasattr(args, "memory") and args.memory is not None:
         conf.set("Fishnet", "Memory", args.memory)
     if hasattr(args, "threads") and args.threads is not None:
@@ -1119,6 +1176,8 @@ def load_conf(args):
         conf.set("Fishnet", "Endpoint", args.endpoint)
     if hasattr(args, "fixed_backoff") and args.fixed_backoff is not None:
         conf.set("Fishnet", "FixedBackoff", str(args.fixed_backoff))
+    if hasattr(args, "mongodb") and args.mongodb is not None:
+        conf.set("Fishnet", "MongoDB", str(args.mongodb))
     for option_name, option_value in args.setoption:
         conf.set("Stockfish", option_name.lower(), option_value)
 
@@ -1205,12 +1264,21 @@ def configure(args):
                          validate_cores, out)
     conf.set("Fishnet", "Cores", str(cores))
 
+    nodes = config_input("Analysis node limit (default 3500000): ", validate_nodes, out)
+    conf.set("Fishnet", "Nodes", str(nodes))
+
+    movetime = config_input("Analysis movetime limit (-1 for unlimited, default 4000): ", validate_movetime, out)
+    conf.set("Fishnet", "MoveTime", str(movetime))
+
     # Advanced options
     endpoint = args.endpoint or DEFAULT_ENDPOINT
+    connstr = ""
     if config_input("Configure advanced options? (default: no) ", parse_bool, out):
         endpoint = config_input("Fishnet API endpoint (default: %s): " % (endpoint, ), validate_endpoint, out)
+        connstr = config_input("MongoDB connection string (default: none): ", validate_mongo, out)
 
     conf.set("Fishnet", "Endpoint", endpoint)
+    conf.set("Fishnet", "MongoDB", connstr)
 
     # Change key?
     key = None
@@ -1290,6 +1358,25 @@ def parse_bool(inp, default=False):
     else:
         raise ConfigError("Not a boolean value: %s", inp)
 
+def validate_nodes(nodes):
+    if not nodes or not nodes.strip():
+        return 3500000
+    try:
+        nodes = int(nodes.strip())
+    except ValueError:
+        raise ConfigError("Number of nodes must be an integer")
+
+    return nodes
+
+def validate_movetime(movetime):
+    if not movetime or not movetime.strip():
+        return 4000
+    try:
+        movetime = int(movetime.strip())
+    except ValueError:
+        raise ConfigError("Number of movetime must be an integer")
+
+    return movetime
 
 def validate_cores(cores):
     if not cores or cores.strip().lower() == "auto":
@@ -1353,6 +1440,11 @@ def validate_memory(memory, conf):
 
     return memory
 
+def validate_mongo(conn_str):
+    if not conn_str or not conn_str.strip():
+        return ""
+
+    return conn_str.strip()
 
 def validate_endpoint(endpoint):
     if not endpoint or not endpoint.strip():
@@ -1401,10 +1493,14 @@ def conf_get(conf, key, default=None, section="Fishnet"):
     else:
         return conf.get(section, key)
 
-
 def get_engine_dir(conf):
     return validate_engine_dir(conf_get(conf, "EngineDir"))
 
+def get_nodes(conf):
+    return validate_nodes(conf_get(conf, "Nodes"))
+
+def get_movetime(conf):
+    return validate_movetime(conf_get(conf, "MoveTime"))
 
 def get_stockfish_command(conf, update=True):
     stockfish_command = validate_stockfish_command(conf_get(conf, "StockfishCommand"), conf)
@@ -1424,7 +1520,7 @@ def get_endpoint(conf, sub=""):
 def is_production_endpoint(conf):
     endpoint = validate_endpoint(conf_get(conf, "Endpoint"))
     hostname = urlparse.urlparse(endpoint).hostname
-    return hostname == "lichess.org" or hostname.endswith(".lichess.org")
+    return hostname == DEFAULT_HOST or hostname.endswith("." + DEFAULT_HOST)
 
 
 def get_key(conf):
@@ -1440,6 +1536,16 @@ def start_backoff(conf):
         while True:
             yield 0.5 * backoff + 0.5 * backoff * random.random()
             backoff = min(backoff + 1, MAX_BACKOFF)
+
+def get_mongo_collection(conf):
+    collection = None
+    connStr = validate_mongo(conf_get(conf, "MongoDB"))
+    if connStr and connStr.strip():
+        logging.debug("Try connect to MongoDB: %s", connStr)
+        client = MongoClient(connStr)
+        db = client.fishnet
+        collection = db.analysis
+    return collection
 
 
 def lookup_latest_version():
@@ -1858,7 +1964,7 @@ def main(argv):
     g.add_argument("--memory", help="total memory (MB) to use for engine hashtables")
 
     g = parser.add_argument_group("advanced")
-    g.add_argument("--endpoint", help="lichess http endpoint (default: %s)" % DEFAULT_ENDPOINT)
+    g.add_argument("--endpoint", help="your chess server http endpoint (default: %s)" % DEFAULT_ENDPOINT)
     g.add_argument("--engine-dir", help="engine working directory")
     g.add_argument("--stockfish-command", help="stockfish command (default: download precompiled Stockfish)")
     g.add_argument("--threads-per-process", "--threads", type=int, dest="threads", help="hint for the number of threads to use per engine process (default: 4)")
