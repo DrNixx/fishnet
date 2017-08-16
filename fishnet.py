@@ -789,6 +789,7 @@ class Worker(threading.Thread):
 
     def set_cache(self, fen, part):
         if self.mongo is not None:
+            logging.debug("Save position %s to cache", fen)
             result = self.mongo.update_one({"_id": fen}, {'$set': {'p': part}})
             if result.matched_count == 0:
                 self.mongo.insert_one({
