@@ -788,7 +788,6 @@ class Worker(threading.Thread):
         return part
 
     def set_cache(self, fen, part):
-        logging.debug("Try set cache")
         if self.mongo is not None:
             logging.debug("Save position %s to cache", fen)
             result = self.mongo.update_one({"_id": fen}, {'$set': {'p': part}})
@@ -854,6 +853,7 @@ class Worker(threading.Thread):
         movetime = job.get("movetime") or self.analysis_movetime
         if (movetime == -1):
             movetime=None
+            logging.debug("Use FEN mode")
 
         if fens is not None:
             fens.insert(0, job["position"])
