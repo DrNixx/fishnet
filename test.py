@@ -38,7 +38,7 @@ class WorkerTest(unittest.TestCase):
         self.worker.start_stockfish()
 
     def tearDown(self):
-        fishnet.send(self.worker.stockfish, "quit")
+        self.worker.stop()
 
     def test_bestmove(self):
         job = {
@@ -53,9 +53,40 @@ class WorkerTest(unittest.TestCase):
             "moves": "f2f3 e7e6 g2g4",
         }
 
-        result = self.worker.bestmove(job)["move"]
+        response = self.worker.bestmove(job)
+        self.assertEqual(response["move"]["bestmove"], "d8h4")
 
-        self.assertEqual(result["bestmove"], "d8h4")
+    def test_zh_bestmove(self):
+        job = {
+            "work": {
+                "type": "move",
+                "id": "hihihihi",
+                "level": 1,
+            },
+            "game_id": "ihihihih",
+            "variant": "crazyhouse",
+            "position": "rnbqk1nr/ppp2ppp/3b4/3N4/4p1PP/5P2/PPPPP3/R1BQKBNR/P b KQkq - 9 5",
+            "moves": "d6g3",
+        }
+
+        response = self.worker.bestmove(job)
+        self.assertEqual(response["move"]["bestmove"], "P@f2") # only move
+
+    def test_3check_bestmove(self):
+        job = {
+            "work": {
+                "type": "move",
+                "id": "3c3c3c3c",
+                "level": 8,
+            },
+            "game_id": "c3c3c3c3",
+            "variant": "threecheck",
+            "position": "r1b1kbnr/pppp1ppp/2n2q2/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 4 4 +2+0",
+            "moves": "f1c4 d7d6",
+        }
+
+        response = self.worker.bestmove(job)
+        self.assertEqual(response["move"]["bestmove"], "c4f7")
 
     def test_analysis(self):
         job = {
@@ -67,12 +98,15 @@ class WorkerTest(unittest.TestCase):
             "variant": "standard",
             "position": STARTPOS,
             "moves": "f2f3 e7e6 g2g4 d8h4",
+            "skipPositions": [1],
         }
 
         response = self.worker.analysis(job)
         result = response["analysis"]
 
         self.assertTrue(0 <= result[0]["score"]["cp"] <= 90)
+
+        self.assertTrue(result[1]["skipped"])
 
         self.assertEqual(result[3]["score"]["mate"], 1)
         self.assertTrue(result[3]["pv"].startswith("d8h4"))

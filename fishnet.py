@@ -95,7 +95,7 @@ except NameError:
     pass
 
 
-__version__ = "1.14.5"
+__version__ = "1.15.9"
 
 __author__ = "Niklas Fiekas"
 __email__ = "niklas.fiekas@backscattering.de"
@@ -115,6 +115,7 @@ STAT_INTERVAL = 60.0
 DEFAULT_CONFIG = "fishnet.ini"
 PROGRESS_REPORT_INTERVAL = 5.0
 CHECK_PYPI_CHANCE = 0.01
+LVL_SKILL = [0, 3, 6, 10, 14, 16, 18, 20]
 LVL_MOVETIMES = [50, 100, 150, 200, 300, 400, 500, 1000]
 LVL_DEPTHS = [1, 1, 2, 3, 5, 8, 13, 22]
 
@@ -249,6 +250,9 @@ def setup_logging(verbosity, stream=sys.stdout):
         else:
             handler.setLevel(logging.INFO)
 
+    if verbosity < 2:
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+
     tail_target = logging.StreamHandler(stream)
     tail_target.setFormatter(LogFormatter())
     logger.addHandler(TailLogHandler(35, handler.level, logging.ERROR, tail_target))
@@ -333,12 +337,17 @@ def open_process(command, cwd=None, shell=True, _popen_lock=threading.Lock()):
 
 
 def kill_process(p):
+    p.stdin.close()
+    p.stdout.close()
+
     try:
         # Windows
         p.send_signal(signal.CTRL_BREAK_EVENT)
     except AttributeError:
         # Unix
         os.killpg(p.pid, signal.SIGKILL)
+
+    p.wait()
 
 
 def send(p, line):
@@ -387,13 +396,13 @@ def uci(p):
         elif command == "option":
             if arg.startswith("name UCI_Variant type combo default chess"):
                 for variant in arg.split(" ")[6:]:
-                    if variant is not "var":
+                    if variant != "var":
                         variants.add(variant)
         elif command == "Stockfish" and " by " in arg:
             # Ignore identification line
             pass
         else:
-            logging.warning("Unexpected engine output: %s %s", command, arg)
+            logging.warning("Unexpected engine response to uci: %s %s", command, arg)
 
 
 def isready(p):
@@ -405,7 +414,7 @@ def isready(p):
         elif command == "info" and arg.startswith("string "):
             pass
         else:
-            logging.warning("Unexpected engine output: %s %s", command, arg)
+            logging.warning("Unexpected engine response to isready: %s %s", command, arg)
 
 
 def setoption(p, name, value):
@@ -512,7 +521,7 @@ def go(p, position, moves, movetime=None, clock=None, depth=None, nodes=None):
             if score_kind and score_value is not None and not score_bound:
                 info["score"] = {score_kind: score_value}
         else:
-            logging.warning("Unexpected engine output: %s %s", command, arg)
+            logging.warning("Unexpected engine response to go: %s %s", command, arg)
 
 
 def set_variant_options(p, variant):
@@ -798,18 +807,30 @@ class Worker(threading.Thread):
                     "h": 1
                 })
 
+    def job_name(self, job, ply=None):
+        builder = []
+        if job.get("game_id"):
+            builder.append(base_url(get_endpoint(self.conf)))
+            builder.append(job["game_id"])
+        else:
+            builder.append(job["work"]["id"])
+        if ply is not None:
+            builder.append("#")
+            builder.append(str(ply))
+        return "".join(builder)
 
     def bestmove(self, job):
         lvl = job["work"]["level"]
         variant = job.get("variant", "standard")
         moves = job["moves"].split(" ")
 
-        logging.debug("Playing %s%s (%s) with lvl %d",
-                      base_url(get_endpoint(self.conf)), job["game_id"],
-                      variant, lvl)
+        logging.debug("Playing %s (%s) with lvl %d",
+                      self.job_name(job), variant, lvl)
 
         set_variant_options(self.stockfish, job.get("variant", "standard"))
-        setoption(self.stockfish, "Skill Level", int(round((lvl - 1) * 20.0 / 7)))
+        setoption(self.stockfish, "Skill Level", LVL_SKILL[lvl - 1])
+        setoption(self.stockfish, "Contempt", 20)
+        send(self.stockfish, "ucinewgame")
         isready(self.stockfish)
 
         movetime = int(round(LVL_MOVETIMES[lvl - 1] / (self.threads * 0.9 ** (self.threads - 1))))
@@ -820,8 +841,8 @@ class Worker(threading.Thread):
                   depth=LVL_DEPTHS[lvl - 1])
         end = time.time()
 
-        logging.log(PROGRESS, "Played move in %s%s (%s) with lvl %d: %0.3fs elapsed, depth %d",
-                    base_url(get_endpoint(self.conf)), job["game_id"], variant,
+        logging.log(PROGRESS, "Played move in %s (%s) with lvl %d: %0.3fs elapsed, depth %d",
+                    self.job_name(job), variant,
                     lvl, end - start, part.get("depth", 0))
 
         self.nodes += part.get("nodes", 0)
@@ -844,8 +865,7 @@ class Worker(threading.Thread):
 
         set_variant_options(self.stockfish, variant)
         setoption(self.stockfish, "Skill Level", 20)
-        isready(self.stockfish)
-
+        setoption(self.stockfish, "Contempt", 0)
         send(self.stockfish, "ucinewgame")
         isready(self.stockfish)
 
@@ -857,16 +877,22 @@ class Worker(threading.Thread):
 
         if fens is not None:
             fens.insert(0, job["position"])
+        
+        skip = job.get("skipPositions", [])
+        num_positions = 0
 
         for ply in range(len(moves), -1, -1):
+            if ply in skip:
+                result["analysis"][ply] = { "skipped": True }
+                continue
+
             if last_progress_report + PROGRESS_REPORT_INTERVAL < time.time():
                 if self.progress_reporter:
                     self.progress_reporter.send(job, result)
                 last_progress_report = time.time()
 
-            logging.log(PROGRESS, "Analysing %s game %s%s#%d",
-                        variant,
-                        base_url(get_endpoint(self.conf)), job["game_id"], ply)
+            logging.log(PROGRESS, "Analysing %s: %s",
+                        variant, self.job_name(job, ply))
 
             if fens is None:
                 part = go(self.stockfish, job["position"], moves[0:ply], 
@@ -889,13 +915,18 @@ class Worker(threading.Thread):
 
             self.nodes += part.get("nodes", 0)
             self.positions += 1
+            num_positions += 1
 
             result["analysis"][ply] = part
 
         end = time.time()
-        logging.info("%s%s took %0.1fs (%0.2fs per position)",
-                     base_url(get_endpoint(self.conf)), job["game_id"],
-                     end - start, (end - start) / (len(moves) + 1))
+
+        if num_positions:
+            logging.info("%s took %0.1fs (%0.2fs per position)",
+                         self.job_name(job),
+                         end - start, (end - start) / num_positions)
+        else:
+            logging.info("%s done (nothing to do)", self.job_name(job))
 
         return result
 
@@ -944,6 +975,8 @@ def detect_cpu_capabilities():
             logging.warning("Unexpected cpuid output: %s", line)
 
     # Done
+    process.stdin.close()
+    process.stdout.close()
     process.wait()
     if process.returncode != 0:
         logging.error("cpuid exited with status code %d", process.returncode)
@@ -1045,7 +1078,7 @@ def is_user_site_package():
     return os.path.abspath(__file__).startswith(os.path.join(user_site, ""))
 
 
-def update_self(force=False):
+def update_self():
     # Ensure current instance is installed as a package
     if __package__ is None:
         raise ConfigError("Not started as a package (python -m). Can not update using pip")
@@ -1067,13 +1100,6 @@ def update_self(force=False):
         else:
             raise ConfigError("Auto update enabled, but pip not installed")
 
-    # Check pip is up to date
-    pip_up_to_date = LooseVersion(pip.__version__) >= LooseVersion("8.0.0")
-    if pip_up_to_date:
-        logging.debug("using pip %s", pip.__version__)
-    else:
-        logging.warning("using pip %s < 8.0.0", pip.__version__)
-
     # Ensure module file is going to be writable
     try:
         with open(__file__, "r+"):
@@ -1083,12 +1109,13 @@ def update_self(force=False):
                           "to module file. Use virtualenv or "
                           "pip install --user")
 
-    # Check for updates
-    if not update_available():
-        if not force:
-            return 0
-        else:
-            logging.info("Updating anyway")
+    # Look up the latest version
+    result = requests.get("https://pypi.org/pypi/fishnet/json", timeout=HTTP_TIMEOUT).json()
+    latest_version = result["info"]["version"]
+    url = result["releases"][latest_version][0]["url"]
+    if latest_version == __version__:
+        logging.info("Already up to date.")
+        return 0
 
     # Wait
     t = random.random() * 15.0
@@ -1097,28 +1124,13 @@ def update_self(force=False):
 
     print()
 
-    # Force download
-    if force:
-        if pip_up_to_date:
-            logging.info("$ pip download fishnet")
-            ret = pip.main(["download", "fishnet"])
-        else:
-            logging.info("$ pip install --download fishnet")
-            ret = pip.main(["install", "--download", "fishnet"])
-
-        if ret != 0:
-            logging.warning("Unexpected exit code for pip download: %d", ret)
-            return ret
-
-        print()
-
     # Update
     if is_user_site_package():
-        logging.info("$ pip install --user --upgrade fishnet")
-        ret = pip.main(["install", "--user", "--upgrade", "fishnet"])
+        logging.info("$ pip install --user --upgrade %s", url)
+        ret = pip.main(["install", "--user", "--upgrade", url])
     else:
-        logging.info("$ pip install --upgrade fishnet")
-        ret = pip.main(["install", "--upgrade", "fishnet"])
+        logging.info("$ pip install --upgrade %s", url)
+        ret = pip.main(["install", "--upgrade", url])
     if ret != 0:
         logging.warning("Unexpected exit code for pip install: %d", ret)
         return ret
@@ -1290,7 +1302,7 @@ def configure(args):
 
     # Key
     if key is None:
-        status = "required" if is_production_endpoint(conf) else "probably not required"
+        status = "https://lichess.org/get-fishnet" if is_production_endpoint(conf) else "probably not required"
         key = config_input("Personal fishnet key (append ! to force, %s): " % status,
                            lambda v: validate_key(v, conf, network=True), out)
     conf.set("Fishnet", "Key", key)
@@ -1550,14 +1562,10 @@ def get_mongo_collection(conf):
     return collection
 
 
-def lookup_latest_version():
-    result = requests.get("https://pypi.python.org/pypi/fishnet/json", timeout=HTTP_TIMEOUT).json()
-    return result["info"]["version"]
-
-
 def update_available():
     try:
-        latest_version = lookup_latest_version()
+        result = requests.get("https://pypi.org/pypi/fishnet/json", timeout=HTTP_TIMEOUT).json()
+        latest_version = result["info"]["version"]
     except Exception:
         logging.exception("Failed to check for update on PyPI")
         return False
@@ -1829,10 +1837,7 @@ def make_cpuid():
 
     # Select kernel32 or libc
     if is_windows:
-        if is_64bit:
-            libc = ctypes.CDLL("kernel32.dll")
-        else:
-            libc = ctypes.windll.kernel32
+        libc = ctypes.windll.kernel32
     else:
         libc = ctypes.cdll.LoadLibrary(None)
 
@@ -1896,6 +1901,8 @@ def make_cpuid():
 
     if is_windows:
         # Allocate executable memory
+        libc.VirtualAlloc.restype = ctypes.c_void_p
+        libc.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.c_ulong]
         addr = libc.VirtualAlloc(None, code_size, 0x1000, 0x40)
         if not addr:
             raise MemoryError("Could not VirtualAlloc RWX memory")
@@ -1930,6 +1937,8 @@ def make_cpuid():
 
     # Free
     if is_windows:
+        libc.VirtualFree.restype = ctypes.c_long
+        libc.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong]
         libc.VirtualFree(addr, 0, 0x8000)
     else:
         libc.free.restype = None
@@ -1999,7 +2008,7 @@ def main(argv):
     except UpdateRequired:
         if args.auto_update:
             logging.info("\n\n### Updating ...\n")
-            update_self(force=True)
+            update_self()
 
         logging.error("Update required. Exiting (status 70)")
         return 70
