@@ -811,7 +811,7 @@ class Worker(threading.Thread):
         builder = []
         if job.get("game_id"):
             builder.append(base_url(get_endpoint(self.conf)))
-            builder.append(job["game_id"])
+            builder.append(str(job["game_id"]))
         else:
             builder.append(job["work"]["id"])
         if ply is not None:
