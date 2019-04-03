@@ -32,6 +32,7 @@ import contextlib
 import multiprocessing
 import threading
 import site
+import struct
 import sys
 import os
 import stat
