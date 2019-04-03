@@ -1,8 +1,9 @@
 FROM python:slim
 
-LABEL maintainer "Sylvain Ageneau <ageneau@gmail.com>"
+LABEL maintainer "Manuel Klemenz <manuel.klemenz@gmail.com>"
 
 WORKDIR /tmp/fishnet/
-RUN pip install fishnet
+RUN pip install dumb-init && \
+    pip install fishnet
 
-ENTRYPOINT ["python", "-m", "fishnet", "--no-conf"]
+ENTRYPOINT ["dumb-init", "--", "python", "-m", "fishnet", "--no-conf"]
