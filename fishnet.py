@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # This file is part of the lichess.org fishnet client.
-# Copyright (C) 2016-2017 Niklas Fiekas <niklas.fiekas@backscattering.de>
+# Copyright (C) 2016-2019 Niklas Fiekas <niklas.fiekas@backscattering.de>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -90,12 +90,20 @@ except ImportError:
     from pipes import quote as shell_quote
 
 try:
+    # Python 2
     input = raw_input
 except NameError:
     pass
 
+try:
+    # Python 3
+    DEAD_ENGINE_ERRORS = (EOFError, IOError, BrokenPipeError)
+except NameError:
+    # Python 2
+    DEAD_ENGINE_ERRORS = (EOFError, IOError)
 
-__version__ = "1.15.9"
+
+__version__ = "1.15.15"
 
 __author__ = "Niklas Fiekas"
 __email__ = "niklas.fiekas@backscattering.de"
@@ -337,9 +345,6 @@ def open_process(command, cwd=None, shell=True, _popen_lock=threading.Lock()):
 
 
 def kill_process(p):
-    p.stdin.close()
-    p.stdout.close()
-
     try:
         # Windows
         p.send_signal(signal.CTRL_BREAK_EVENT)
@@ -347,7 +352,7 @@ def kill_process(p):
         # Unix
         os.killpg(p.pid, signal.SIGKILL)
 
-    p.wait()
+    p.communicate()
 
 
 def send(p, line):
@@ -433,7 +438,6 @@ def go(p, position, moves, movetime=None, clock=None, depth=None, nodes=None):
     if moves is not None:
         cmd += " moves %s" % (" ".join(moves))
     send(p, cmd)
-    isready(p)
 
     builder = []
     builder.append("go")
@@ -468,7 +472,6 @@ def go(p, position, moves, movetime=None, clock=None, depth=None, nodes=None):
             bestmove = arg.split()[0]
             if bestmove and bestmove != "(none)":
                 info["bestmove"] = bestmove
-            isready(p)
             return info
         elif command == "info":
             arg = arg or ""
@@ -573,10 +576,13 @@ class ProgressReporter(threading.Thread):
                 response = self.http.post(get_endpoint(self.conf, path),
                                           data=data,
                                           timeout=HTTP_TIMEOUT)
-                if response.status_code != 204:
+                if response.status_code == 429:
+                    logging.error("Too many requests. Suspending progress reports for 60s ...")
+                    time.sleep(60.0)
+                elif response.status_code != 204:
                     logging.error("Expected status 204 for progress report, got %d", response.status_code)
-            except:
-                logging.exception("Could not send progress report. Continuing.")
+            except requests.RequestException as err:
+                logging.warning("Could not send progress report (%s). Continuing.", err)
 
 
 class Worker(threading.Thread):
@@ -585,17 +591,19 @@ class Worker(threading.Thread):
         self.conf = conf
         self.threads = threads
         self.memory = memory
+
         self.progress_reporter = progress_reporter
 
         self.alive = True
         self.fatal_error = None
         self.finished = threading.Event()
         self.sleep = threading.Event()
-        self.status_lock = threading.Lock()
+        self.status_lock = threading.RLock()
 
         self.nodes = 0
         self.positions = 0
 
+        self.stockfish_lock = threading.RLock()
         self.stockfish = None
         self.stockfish_info = None
 
@@ -603,16 +611,20 @@ class Worker(threading.Thread):
         self.backoff = start_backoff(self.conf)
         self.analysis_nodes = get_nodes(self.conf)
         self.analysis_movetime = get_movetime(self.conf)
-
         self.mongo = get_mongo_collection(self.conf)
+
+        self.http = requests.Session()
+        self.http.mount("http://", requests.adapters.HTTPAdapter(max_retries=1))
+        self.http.mount("https://", requests.adapters.HTTPAdapter(max_retries=1))
+
+    def set_name(self, name):
+        self.name = name
+        self.progress_reporter.name = "%s (P)" % (name, )
 
     def stop(self):
         with self.status_lock:
             self.alive = False
-
-            if self.stockfish:
-                kill_process(self.stockfish)
-
+            self.kill_stockfish()
             self.sleep.set()
 
     def stop_soon(self):
@@ -638,20 +650,12 @@ class Worker(threading.Thread):
 
     def run_inner(self):
         try:
-            # Python 3
-            dead_engine_errors = (EOFError, IOError, BrokenPipeError)
-        except NameError:
-            # Python 2
-            dead_engine_errors = (EOFError, IOError)
-
-        try:
-            # Check if the engine is still alive and restart, if necessary
-            if not self.stockfish or self.stockfish.poll() is not None:
-                self.start_stockfish()
+            # Check if the engine is still alive and start, if necessary
+            self.start_stockfish()
 
             # Do the next work unit
             path, request = self.work()
-        except dead_engine_errors:
+        except DEAD_ENGINE_ERRORS:
             alive = self.is_alive()
             if alive:
                 t = next(self.backoff)
@@ -662,23 +666,20 @@ class Worker(threading.Thread):
 
             if alive:
                 self.sleep.wait(t)
-                kill_process(self.stockfish)
+                self.kill_stockfish()
 
             return
 
         try:
             # Report result and fetch next job
-            response = requests.post(get_endpoint(self.conf, path),
-                                     json=request,
-                                     timeout=HTTP_TIMEOUT)
-        except Exception:
+            response = self.http.post(get_endpoint(self.conf, path),
+                                      json=request,
+                                      timeout=HTTP_TIMEOUT)
+        except requests.RequestException as err:
             self.job = None
             t = next(self.backoff)
-            logging.exception("Backing off %0.1fs after exception in worker", t)
+            logging.error("Backing off %0.1fs after failed request (%s)", t, err)
             self.sleep.wait(t)
-
-            # If in doubt, restart engine
-            kill_process(self.stockfish)
         else:
             if response.status_code == 204:
                 self.job = None
@@ -696,7 +697,7 @@ class Worker(threading.Thread):
                 self.sleep.wait(t)
             elif 400 <= response.status_code <= 499:
                 self.job = None
-                t = next(self.backoff)
+                t = next(self.backoff) + (60 if response.status_code == 429 else 0)
                 try:
                     logging.debug("Client error: HTTP %d %s: %s", response.status_code, response.reason, response.text)
                     error = response.json()["error"]
@@ -729,15 +730,29 @@ class Worker(threading.Thread):
                 logging.info("Aborted job %s", self.job["work"]["id"])
             else:
                 logging.error("Unexpected HTTP status for abort: %d", response.status_code)
-        except:
+        except requests.RequestException:
             logging.exception("Could not abort job. Continuing.")
 
         self.job = None
 
+    def kill_stockfish(self):
+        with self.stockfish_lock:
+            if self.stockfish:
+                try:
+                    kill_process(self.stockfish)
+                except OSError:
+                    logging.exception("Failed to kill engine process.")
+                self.stockfish = None
+
     def start_stockfish(self):
-        # Start process
-        self.stockfish = open_process(get_stockfish_command(self.conf, False),
-                                      get_engine_dir(self.conf))
+        with self.stockfish_lock:
+            # Check if already running.
+            if self.stockfish and self.stockfish.poll() is None:
+                return
+
+            # Start process
+            self.stockfish = open_process(get_stockfish_command(self.conf, False),
+                                          get_engine_dir(self.conf))
 
         self.stockfish_info, _ = uci(self.stockfish)
         self.stockfish_info.pop("author", None)
@@ -749,6 +764,7 @@ class Worker(threading.Thread):
         self.stockfish_info["options"] = {}
         self.stockfish_info["options"]["threads"] = str(self.threads)
         self.stockfish_info["options"]["hash"] = str(self.memory)
+        self.stockfish_info["options"]["analysis contempt"] = "Off"
 
         # Custom options
         if self.conf.has_section("Stockfish"):
@@ -829,7 +845,7 @@ class Worker(threading.Thread):
 
         set_variant_options(self.stockfish, job.get("variant", "standard"))
         setoption(self.stockfish, "Skill Level", LVL_SKILL[lvl - 1])
-        setoption(self.stockfish, "Contempt", 20)
+        setoption(self.stockfish, "UCI_AnalyseMode", False)
         send(self.stockfish, "ucinewgame")
         isready(self.stockfish)
 
@@ -865,7 +881,7 @@ class Worker(threading.Thread):
 
         set_variant_options(self.stockfish, variant)
         setoption(self.stockfish, "Skill Level", 20)
-        setoption(self.stockfish, "Contempt", 0)
+        setoption(self.stockfish, "UCI_AnalyseMode", True)
         send(self.stockfish, "ucinewgame")
         isready(self.stockfish)
 
@@ -879,11 +895,12 @@ class Worker(threading.Thread):
             fens.insert(0, job["position"])
         
         skip = job.get("skipPositions", [])
+
         num_positions = 0
 
         for ply in range(len(moves), -1, -1):
             if ply in skip:
-                result["analysis"][ply] = { "skipped": True }
+                result["analysis"][ply] = {"skipped": True}
                 continue
 
             if last_progress_report + PROGRESS_REPORT_INTERVAL < time.time():
@@ -933,7 +950,7 @@ class Worker(threading.Thread):
 
 def detect_cpu_capabilities():
     # Detects support for popcnt and pext instructions
-    modern, bmi2 = False, False
+    vendor, modern, bmi2 = "", False, False
 
     # Run cpuid in subprocess for robustness in case of segfaults
     cmd = []
@@ -964,6 +981,10 @@ def detect_cpu_capabilities():
         elif len(columns) == 5 and all(all(c in string.hexdigits for c in col) for col in columns):
             eax, a, b, c, d = [int(col, 16) for col in columns]
 
+            # vendor
+            if eax == 0:
+                vendor = struct.pack("III", b, d, c).decode("utf-8")
+
             # popcnt
             if eax == 1 and c & (1 << 23):
                 modern = True
@@ -975,20 +996,18 @@ def detect_cpu_capabilities():
             logging.warning("Unexpected cpuid output: %s", line)
 
     # Done
-    process.stdin.close()
-    process.stdout.close()
-    process.wait()
+    process.communicate()
     if process.returncode != 0:
         logging.error("cpuid exited with status code %d", process.returncode)
 
-    return modern, bmi2
+    return vendor, modern, bmi2
 
 
 def stockfish_filename():
     machine = platform.machine().lower()
 
-    modern, bmi2 = detect_cpu_capabilities()
-    if modern and bmi2:
+    vendor, modern, bmi2 = detect_cpu_capabilities()
+    if modern and "Intel" in vendor and bmi2:
         suffix = "-bmi2"
     elif modern:
         suffix = "-modern"
@@ -1081,24 +1100,22 @@ def is_user_site_package():
 def update_self():
     # Ensure current instance is installed as a package
     if __package__ is None:
-        raise ConfigError("Not started as a package (python -m). Can not update using pip")
+        raise ConfigError("Not started as a package (python -m). Cannot update using pip")
 
     if all(dirname not in ["site-packages", "dist-packages"] for dirname in __file__.split(os.sep)):
-        raise ConfigError("Not installed as package (%s). Can not update using pip" % __file__)
+        raise ConfigError("Not installed as package (%s). Cannot update using pip" % __file__)
 
     logging.debug("Package: \"%s\", name: %s, loader: %s",
                   __package__, __name__, __loader__)
 
     # Ensure pip is available
     try:
-        import pip
-    except ImportError as e:
-        if "IncompleteRead" in str(e):
-            # Version incompatible with requests:
-            # https://github.com/pypa/pip/commit/796320abac38410316067bbb9455007cc51079db
-            raise ConfigError("Auto update enabled, but pip >= 6.0 required")
-        else:
-            raise ConfigError("Auto update enabled, but pip not installed")
+        pip_info = subprocess.check_output([sys.executable, "-m", "pip", "--version"],
+                                           universal_newlines=True)
+    except OSError:
+        raise ConfigError("Auto update enabled, but cannot run pip")
+    else:
+        logging.debug("Pip: %s", pip_info.rstrip())
 
     # Ensure module file is going to be writable
     try:
@@ -1127,10 +1144,12 @@ def update_self():
     # Update
     if is_user_site_package():
         logging.info("$ pip install --user --upgrade %s", url)
-        ret = pip.main(["install", "--user", "--upgrade", url])
+        ret = subprocess.call([sys.executable, "-m", "pip", "install", "--user", "--upgrade", url],
+                              stdout=sys.stdout, stderr=sys.stderr)
     else:
         logging.info("$ pip install --upgrade %s", url)
-        ret = pip.main(["install", "--upgrade", url])
+        ret = subprocess.call([sys.executable, "-m", "pip", "install", "--upgrade", url],
+                              stdout=sys.stdout, stderr=sys.stderr)
     if ret != 0:
         logging.warning("Unexpected exit code for pip install: %d", ret)
         return ret
@@ -1288,7 +1307,7 @@ def configure(args):
     endpoint = args.endpoint or DEFAULT_ENDPOINT
     connstr = ""
     if config_input("Configure advanced options? (default: no) ", parse_bool, out):
-        endpoint = config_input("Fishnet API endpoint (default: %s): " % (endpoint, ), validate_endpoint, out)
+        endpoint = config_input("Fishnet API endpoint (default: %s): " % (endpoint, ), lambda inp: validate_endpoint(inp, endpoint), out)
         connstr = config_input("MongoDB connection string (default: none): ", validate_mongo, out)
 
     conf.set("Fishnet", "Endpoint", endpoint)
@@ -1450,19 +1469,18 @@ def validate_memory(memory, conf):
         raise ConfigError("Not enough memory for a minimum of %d x %d MB in hash tables" % (processes, HASH_MIN))
 
     if memory > processes * HASH_MAX:
-        raise ConfigError("Can not reasonably use more than %d x %d MB = %d MB for hash tables" % (processes, HASH_MAX, processes * HASH_MAX))
+        raise ConfigError("Cannot reasonably use more than %d x %d MB = %d MB for hash tables" % (processes, HASH_MAX, processes * HASH_MAX))
 
     return memory
 
 def validate_mongo(conn_str):
     if not conn_str or not conn_str.strip():
         return ""
-
     return conn_str.strip()
 
-def validate_endpoint(endpoint):
+def validate_endpoint(endpoint, default=DEFAULT_ENDPOINT):
     if not endpoint or not endpoint.strip():
-        return DEFAULT_ENDPOINT
+        return default
 
     if not endpoint.endswith("/"):
         endpoint += "/"
@@ -1506,6 +1524,7 @@ def conf_get(conf, key, default=None, section="Fishnet"):
         return default
     else:
         return conf.get(section, key)
+
 
 def get_engine_dir(conf):
     return validate_engine_dir(conf_get(conf, "EngineDir"))
@@ -1560,7 +1579,6 @@ def get_mongo_collection(conf):
         db = client.fishnet
         collection = db.analysis
     return collection
-
 
 def update_available():
     try:
@@ -1644,7 +1662,7 @@ def cmd_run(args):
 
     # Start all threads
     for i, worker in enumerate(workers):
-        worker.name = "><> %d" % (i + 1)
+        worker.set_name("><> %d" % (i + 1))
         worker.setDaemon(True)
         worker.start()
 
@@ -1815,6 +1833,8 @@ def cmd_systemd(args):
         print("# python -m fishnet systemd | sudo tee /etc/systemd/system/fishnet.service", file=sys.stderr)
         print("# sudo systemctl enable fishnet.service", file=sys.stderr)
         print("# sudo systemctl start fishnet.service", file=sys.stderr)
+        print("#", file=sys.stderr)
+        print("# Live view of the log: sudo journalctl --follow -u fishnet", file=sys.stderr)
 
 
 @contextlib.contextmanager
@@ -1845,29 +1865,29 @@ def make_cpuid():
     if is_64bit:
         if is_windows:
             # Windows x86_64
-            # Two first call registers : RCX, RDX
-            # Volatile registers       : RAX, RCX, RDX, R8-11
+            # Three first call registers : RCX, RDX, R8
+            # Volatile registers         : RAX, RCX, RDX, R8-11
             opc = [
                 0x53,                    # push   %rbx
-                0x48, 0x89, 0xd0,        # mov    %rdx,%rax
-                0x49, 0x89, 0xc8,        # mov    %rcx,%r8
-                0x31, 0xc9,              # xor    %ecx,%ecx
+                0x89, 0xd0,              # mov    %edx,%eax
+                0x49, 0x89, 0xc9,        # mov    %rcx,%r9
+                0x44, 0x89, 0xc1,        # mov    %r8d,%ecx
                 0x0f, 0xa2,              # cpuid
-                0x41, 0x89, 0x00,        # mov    %eax,(%r8)
-                0x41, 0x89, 0x58, 0x04,  # mov    %ebx,0x4(%r8)
-                0x41, 0x89, 0x48, 0x08,  # mov    %ecx,0x8(%r8)
-                0x41, 0x89, 0x50, 0x0c,  # mov    %edx,0xc(%r8)
+                0x41, 0x89, 0x01,        # mov    %eax,(%r9)
+                0x41, 0x89, 0x59, 0x04,  # mov    %ebx,0x4(%r9)
+                0x41, 0x89, 0x49, 0x08,  # mov    %ecx,0x8(%r9)
+                0x41, 0x89, 0x51, 0x0c,  # mov    %edx,0xc(%r9)
                 0x5b,                    # pop    %rbx
                 0xc3                     # retq
             ]
         else:
             # Posix x86_64
-            # Two first call registers : RDI, RSI
-            # Volatile registers       : RAX, RCX, RDX, RSI, RDI, R8-11
+            # Three first call registers : RDI, RSI, RDX
+            # Volatile registers         : RAX, RCX, RDX, RSI, RDI, R8-11
             opc = [
                 0x53,                    # push   %rbx
-                0x48, 0x89, 0xf0,        # mov    %rsi,%rax
-                0x31, 0xc9,              # xor    %ecx,%ecx
+                0x89, 0xf0,              # mov    %esi,%eax
+                0x89, 0xd1,              # mov    %edx,%ecx
                 0x0f, 0xa2,              # cpuid
                 0x89, 0x07,              # mov    %eax,(%rdi)
                 0x89, 0x5f, 0x04,        # mov    %ebx,0x4(%rdi)
@@ -1878,14 +1898,14 @@ def make_cpuid():
             ]
     else:
         # CDECL 32 bit
-        # Two first call registers : Stack (%esp)
-        # Volatile registers       : EAX, ECX, EDX
+        # Three first call registers : Stack (%esp)
+        # Volatile registers         : EAX, ECX, EDX
         opc = [
             0x53,                    # push   %ebx
             0x57,                    # push   %edi
             0x8b, 0x7c, 0x24, 0x0c,  # mov    0xc(%esp),%edi
             0x8b, 0x44, 0x24, 0x10,  # mov    0x10(%esp),%eax
-            0x31, 0xc9,              # xor    %ecx,%ecx
+            0x8b, 0x4c, 0x24, 0x14,  # mov    0x14(%esp),%ecx
             0x0f, 0xa2,              # cpuid
             0x89, 0x07,              # mov    %eax,(%edi)
             0x89, 0x5f, 0x04,        # mov    %ebx,0x4(%edi)
@@ -1926,11 +1946,11 @@ def make_cpuid():
 
     # Create and yield callable
     result = CPUID_struct()
-    func_type = ctypes.CFUNCTYPE(None, ctypes.POINTER(CPUID_struct), ctypes.c_uint32)
+    func_type = ctypes.CFUNCTYPE(None, ctypes.POINTER(CPUID_struct), ctypes.c_uint32, ctypes.c_uint32)
     func_ptr = func_type(addr)
 
-    def cpuid(eax):
-        func_ptr(result, eax)
+    def cpuid(eax, ecx=0):
+        func_ptr(result, eax, ecx)
         return result.eax, result.ebx, result.ecx, result.edx
 
     yield cpuid
@@ -2001,6 +2021,7 @@ def main(argv):
     # Show intro
     if args.command not in ["systemd", "cpuid"]:
         print(intro())
+        sys.stdout.flush()
 
     # Run
     try:

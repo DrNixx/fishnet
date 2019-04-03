@@ -2,13 +2,11 @@
 # -*- coding: utf-8 -*-
 
 # This file is part of the lichess.org fishnet client.
-# Copyright (C) 2016-2017 Niklas Fiekas <niklas.fiekas@backscattering.de>
+# Copyright (C) 2016-2019 Niklas Fiekas <niklas.fiekas@backscattering.de>
 # See LICENSE.txt for licensing information.
 
 import fishnet
-import argparse
 import unittest
-import logging
 import sys
 import multiprocessing
 
@@ -113,33 +111,32 @@ class WorkerTest(unittest.TestCase):
 
         self.assertEqual(result[4]["score"]["mate"], 0)
 
-    def test_fen(self):
+    def test_analysis_contempt(self):
+        fishnet.setoption(self.worker.stockfish, "Threads", 1)
+
         job = {
             "work": {
                 "type": "analysis",
-                "id": "12345678",
+                "id": "contempt 100",
             },
-            "game_id": "87654321",
             "variant": "standard",
             "position": STARTPOS,
-            "moves": "f2f3 e7e6 g2g4 d8h4",
-            "fens": [
-                "rnbqkbnr/pppppppp/8/8/8/5P2/PPPPP1PP/RNBQKBNR b KQkq -", 
-                "rnbqkbnr/pppp1ppp/4p3/8/8/5P2/PPPPP1PP/RNBQKBNR w KQkq -", 
-                "rnbqkbnr/pppp1ppp/4p3/8/6P1/5P2/PPPPP2P/RNBQKBNR b KQkq -", 
-                "rnb1kbnr/pppp1ppp/4p3/8/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq -", 
-            ]
+            "moves": "d2d4 d7d5",
+            "skipPositions": [0, 1],
+            "nodes": 1000,
         }
 
+        fishnet.setoption(self.worker.stockfish, "Contempt", 100)
+
         response = self.worker.analysis(job)
-        result = response["analysis"]
+        cp_100 = response["analysis"][2]["score"]["cp"]
 
-        self.assertTrue(0 <= result[0]["score"]["cp"] <= 90)
+        job["work"]["id"] = "contempt 0"
+        fishnet.setoption(self.worker.stockfish, "Contempt", 0)
+        response = self.worker.analysis(job)
+        cp_0 = response["analysis"][2]["score"]["cp"]
 
-        self.assertEqual(result[3]["score"]["mate"], 1)
-        self.assertTrue(result[3]["pv"].startswith("d8h4"))
-
-        self.assertEqual(result[4]["score"]["mate"], 0)
+        self.assertEqual(cp_100, cp_0)
 
 
 class UnitTests(unittest.TestCase):

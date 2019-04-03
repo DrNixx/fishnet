@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # This file is part of the lichess.org fishnet client.
-# Copyright (C) 2016-2017 Niklas Fiekas <niklas.fiekas@backscattering.de>
+# Copyright (C) 2016-2019 Niklas Fiekas <niklas.fiekas@backscattering.de>
 # See LICENSE.txt for licensing information.
 
 import setuptools
@@ -14,7 +14,7 @@ with open(os.path.join(os.path.dirname(__file__), "fishnet.py"), "rb") as f:
     # Trick: Strip imports of dependencies
     fishnet = {}
     code = f.read().decode("utf-8")
-    stripped_code = re.sub(r"^(\s*)import requests\s*$", r"\1pass", code, flags=re.MULTILINE).encode("utf-8")
+    stripped_code = re.sub(r"^(\s*)(import requests\s*$)", r"\1pass", code, flags=re.MULTILINE).encode("utf-8")
     eval(compile(stripped_code, "fishnet.py", "exec"), fishnet)
 
 
@@ -37,11 +37,12 @@ setuptools.setup(
     author_email=fishnet["__email__"],
     description=fishnet["__doc__"].replace("\n", " ").strip(),
     long_description=read_description(),
+    long_description_content_type="text/x-rst",
     keywords="lichess.org chess-online.com chess stockfish uci",
     url="https://github.com/DrNixx/fishnet",
     py_modules=["fishnet"],
     test_suite="test",
-    install_requires=["requests", "pymongo"],
+    install_requires=["requests>=2,<3", "pymongo"],
     python_requires=">=2.7,!=3.0.*,!=3.1.*,!=3.2.*",
     classifiers=[
         "Development Status :: 5 - Production/Stable",
@@ -54,10 +55,10 @@ setuptools.setup(
         "Programming Language :: Python :: 2",
         "Programming Language :: Python :: 2.7",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.3",
         "Programming Language :: Python :: 3.4",
         "Programming Language :: Python :: 3.5",
         "Programming Language :: Python :: 3.6",
+        "Programming Language :: Python :: 3.7",
         "Topic :: Games/Entertainment :: Board Games",
         "Topic :: Internet :: WWW/HTTP",
     ]

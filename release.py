@@ -46,12 +46,15 @@ def tag_and_push():
         sys.exit(1)
 
     system("git tag {0}".format(tagname))
-    system("git push --atomic origin chess-online {0}".format(tagname))
+    system("git push --atomic origin master {0}".format(tagname))
 
 
 def pypi():
     print("--- PYPI -------------------------------------------------------------")
-    system("python3 setup.py sdist upload")
+    system("rm -rf build")
+    system("python3 setup.py sdist")
+    system("twine check dist/*")
+    system("twine upload --skip-existing --sign dist/*")
 
 
 if __name__ == "__main__":
