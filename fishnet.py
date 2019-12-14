@@ -94,7 +94,7 @@ except NameError:
     DEAD_ENGINE_ERRORS = (EOFError, IOError)
 
 
-__version__ = "1.15.15"
+__version__ = "1.15.18"
 
 __author__ = "Niklas Fiekas"
 __email__ = "niklas.fiekas@backscattering.de"
@@ -250,6 +250,7 @@ def setup_logging(verbosity, stream=sys.stdout):
 
     if verbosity < 2:
         logging.getLogger("urllib3").setLevel(logging.WARNING)
+        logging.getLogger("requests.packages.urllib3").setLevel(logging.WARNING)
 
     tail_target = logging.StreamHandler(stream)
     tail_target.setFormatter(LogFormatter())
@@ -464,7 +465,7 @@ def go(p, position, moves, movetime=None, clock=None, depth=None, nodes=None):
             arg = arg or ""
 
             # Parse all other parameters
-            score_kind, score_value, score_bound = None, None, False
+            score_kind, score_value, lowerbound, upperbound = None, None, False, False
             current_parameter = None
             for token in arg.split(" "):
                 if current_parameter == "string":
@@ -496,8 +497,10 @@ def go(p, position, moves, movetime=None, clock=None, depth=None, nodes=None):
                     if token in ["cp", "mate"]:
                         score_kind = token
                         score_value = None
-                    elif token in ["lowerbound", "upperbound"]:
-                        score_bound = True
+                    elif token == "lowerbound":
+                        lowerbound = True
+                    elif token == "upperbound":
+                        upperbound = True
                     else:
                         score_value = int(token)
                 elif current_parameter != "pv" or info.get("multipv", 1) == 1:
@@ -507,9 +510,13 @@ def go(p, position, moves, movetime=None, clock=None, depth=None, nodes=None):
                     else:
                         info[current_parameter] = token
 
-            # Set score if not just a bound
-            if score_kind and score_value is not None and not score_bound:
+            # Set score. Prefer scores that are not just a bound
+            if score_kind and score_value is not None and (not (lowerbound or upperbound) or "score" not in info or info["score"].get("lowerbound") or info["score"].get("upperbound")):
                 info["score"] = {score_kind: score_value}
+                if lowerbound:
+                    info["score"]["lowerbound"] = lowerbound
+                if upperbound:
+                    info["score"]["upperbound"] = upperbound
         else:
             logging.warning("Unexpected engine response to go: %s %s", command, arg)
 
@@ -990,6 +997,8 @@ def download_github_release(conf, release_page, filename):
     if response.status_code == 304:
         logging.info("Local %s is newer than release", filename)
         return filename
+    elif response.status_code != 200:
+        raise ConfigError("Failed to look up latest Stockfish release (status %d)" % (response.status_code, ))
 
     release = response.json()
 
@@ -1638,6 +1647,7 @@ def cmd_systemd(args):
         [Service]
         ExecStart={start}
         WorkingDirectory={cwd}
+        ReadWriteDirectories={cwd}
         User={user}
         Group={group}
         Nice=5
