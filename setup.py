@@ -42,7 +42,7 @@ setuptools.setup(
     url="https://github.com/DrNixx/fishnet",
     py_modules=["fishnet"],
     test_suite="test",
-    install_requires=["requests>=2,<3", "pymongo"],
+    install_requires=["requests>=2,<3"],
     python_requires=">=2.7,!=3.0.*,!=3.1.*,!=3.2.*",
     classifiers=[
         "Development Status :: 5 - Production/Stable",
@@ -59,6 +59,7 @@ setuptools.setup(
         "Programming Language :: Python :: 3.5",
         "Programming Language :: Python :: 3.6",
         "Programming Language :: Python :: 3.7",
+        "Programming Language :: Python :: 3.8",
         "Topic :: Games/Entertainment :: Board Games",
         "Topic :: Internet :: WWW/HTTP",
     ]

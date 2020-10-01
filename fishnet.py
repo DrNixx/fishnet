@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+# PYTHON_ARGCOMPLETE_OK
 
 # This file is part of the lichess.org fishnet client.
-# Copyright (C) 2016-2019 Niklas Fiekas <niklas.fiekas@backscattering.de>
+# Copyright (c) 2016-2020 Niklas Fiekas <niklas.fiekas@backscattering.de>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -52,16 +53,6 @@ except ImportError:
     print(file=sys.stderr)
     raise
 
-try:
-    from pymongo import MongoClient
-except ImportError:
-    print("fishnet use the 'pymongo' module.", file=sys.stderr)
-    print("Try 'pip install pymongo' or install python-pymongo from your distro packages if you need evaluation cache.", file=sys.stderr)
-    print(file=sys.stderr)
-    raise
-
-from distutils.version import LooseVersion
-
 if os.name == "posix" and sys.version_info[0] < 3:
     try:
         import subprocess32 as subprocess
@@ -104,7 +95,7 @@ except NameError:
     DEAD_ENGINE_ERRORS = (EOFError, IOError)
 
 
-__version__ = "1.15.15"
+__version__ = "1.18.1"  # remember to update changelog
 
 __author__ = "Niklas Fiekas"
 __email__ = "niklas.fiekas@backscattering.de"
@@ -119,14 +110,16 @@ HASH_DEFAULT = 256
 HASH_MAX = 512
 MAX_BACKOFF = 30.0
 MAX_FIXED_BACKOFF = 3.0
+TARGET_MOVE_TIME = 2.0
+MAX_MOVE_TIME = 6.0
+MAX_SLOW_BACKOFF = (MAX_MOVE_TIME - TARGET_MOVE_TIME) * 60  # time diff * plies
 HTTP_TIMEOUT = 15.0
 STAT_INTERVAL = 60.0
-DEFAULT_CONFIG = "fishnet.ini"
 PROGRESS_REPORT_INTERVAL = 5.0
 CHECK_PYPI_CHANCE = 0.01
-LVL_SKILL = [0, 3, 6, 10, 14, 16, 18, 20]
+LVL_ELO = [800, 1100, 1400, 1700, 2000, 2300, 2700, 3000]
 LVL_MOVETIMES = [50, 100, 150, 200, 300, 400, 500, 1000]
-LVL_DEPTHS = [1, 1, 2, 3, 5, 8, 13, 22]
+LVL_DEPTHS = [5, 5, 5, 5, 5, 8, 13, 22]
 
 
 def intro():
@@ -261,6 +254,7 @@ def setup_logging(verbosity, stream=sys.stdout):
 
     if verbosity < 2:
         logging.getLogger("urllib3").setLevel(logging.WARNING)
+        logging.getLogger("requests.packages.urllib3").setLevel(logging.WARNING)
 
     tail_target = logging.StreamHandler(stream)
     tail_target.setFormatter(LogFormatter())
@@ -353,7 +347,13 @@ def kill_process(p):
         # Unix
         os.killpg(p.pid, signal.SIGKILL)
 
-    p.communicate()
+    try:
+        # Clean up all pipes
+        p.communicate()
+    except IOError:
+        # Python 2: Ignore "close() called during concurrent operation on the
+        # same file object".
+        logging.warning("Ignoring failure to clean up pipes")
 
 
 def send(p, line):
@@ -435,27 +435,24 @@ def setoption(p, name, value):
 
 
 def go(p, position, moves, movetime=None, clock=None, depth=None, nodes=None):
-    cmd = "position fen %s" % (position)
-    if moves is not None:
-        cmd += " moves %s" % (" ".join(moves))
-    send(p, cmd)
+    send(p, "position fen %s moves %s" % (position, " ".join(moves)))
 
     builder = []
     builder.append("go")
     if movetime is not None:
         builder.append("movetime")
         builder.append(str(movetime))
-    if depth is not None:
-        builder.append("depth")
-        builder.append(str(depth))
     if nodes is not None:
         builder.append("nodes")
         builder.append(str(nodes))
+    if depth is not None:
+        builder.append("depth")
+        builder.append(str(depth))
     if clock is not None:
         builder.append("wtime")
-        builder.append(str(clock["wtime"] * 10))
+        builder.append(str(max(1, clock["wtime"] * 10)))
         builder.append("btime")
-        builder.append(str(clock["btime"] * 10))
+        builder.append(str(max(1, clock["btime"] * 10)))
         builder.append("winc")
         builder.append(str(clock["inc"] * 1000))
         builder.append("binc")
@@ -463,67 +460,94 @@ def go(p, position, moves, movetime=None, clock=None, depth=None, nodes=None):
 
     send(p, " ".join(builder))
 
-    info = {}
-    info["bestmove"] = None
+
+def recv_bestmove(p):
+    while True:
+        command, arg = recv_uci(p)
+        if command == "bestmove":
+            bestmove = arg.split()[0]
+            if bestmove and bestmove != "(none)":
+                return bestmove
+            else:
+                return None
+        elif command == "info":
+            continue
+        else:
+            logging.warning("Unexpected engine response to go: %s %s", command, arg)
+
+
+def encode_score(kind, value):
+    if kind == "mate":
+        if value > 0:
+            return 32000 - value
+        else:
+            return -32000 - value
+    elif kind == "cp":
+        return min(max(value, -30000), 30000)
+
+
+def decode_score(score):
+    if score > 30000:
+        return {"mate": 32000 - score}
+    elif score < -30000:
+        return {"mate": -32000 - score}
+    else:
+        return {"cp": score}
+
+
+def recv_analysis(p):
+    scores = []
+    nodes = []
+    times = []
+    pvs = []
+
+    bound = []
 
     while True:
         command, arg = recv_uci(p)
 
         if command == "bestmove":
-            bestmove = arg.split()[0]
-            if bestmove and bestmove != "(none)":
-                info["bestmove"] = bestmove
-            return info
+            return scores, nodes, times, pvs
         elif command == "info":
-            arg = arg or ""
+            depth = None
+            multipv = 1
 
-            # Parse all other parameters
-            score_kind, score_value, score_bound = None, None, False
-            current_parameter = None
-            for token in arg.split(" "):
-                if current_parameter == "string":
-                    # Everything until the end of line is a string
-                    if "string" in info:
-                        info["string"] += " " + token
-                    else:
-                        info["string"] = token
-                elif token == "score":
-                    current_parameter = "score"
-                elif token == "pv":
-                    current_parameter = "pv"
-                    if info.get("multipv", 1) == 1:
-                        info.pop("pv", None)
-                elif token in ["depth", "seldepth", "time", "nodes", "multipv",
-                               "currmove", "currmovenumber",
-                               "hashfull", "nps", "tbhits", "cpuload",
-                               "refutation", "currline", "string"]:
-                    current_parameter = token
-                    info.pop(current_parameter, None)
-                elif current_parameter in ["depth", "seldepth", "time",
-                                           "nodes", "currmovenumber",
-                                           "hashfull", "nps", "tbhits",
-                                           "cpuload", "multipv"]:
-                    # Integer parameters
-                    info[current_parameter] = int(token)
-                elif current_parameter == "score":
-                    # Score
-                    if token in ["cp", "mate"]:
-                        score_kind = token
-                        score_value = None
-                    elif token in ["lowerbound", "upperbound"]:
-                        score_bound = True
-                    else:
-                        score_value = int(token)
-                elif current_parameter != "pv" or info.get("multipv", 1) == 1:
-                    # Strings
-                    if current_parameter in info:
-                        info[current_parameter] += " " + token
-                    else:
-                        info[current_parameter] = token
+            def set_table(arr, value):
+                while len(arr) < multipv:
+                    arr.append([])
+                while len(arr[multipv - 1]) <= depth:
+                    arr[multipv - 1].append(None)
+                arr[multipv - 1][depth] = value
 
-            # Set score if not just a bound
-            if score_kind and score_value is not None and not score_bound:
-                info["score"] = {score_kind: score_value}
+            tokens = (arg or "").split(" ")
+            while tokens:
+                parameter = tokens.pop(0)
+
+                if parameter == "multipv":
+                    multipv = int(tokens.pop(0))
+                elif parameter == "depth":
+                    depth = int(tokens.pop(0))
+                elif parameter == "nodes":
+                    set_table(nodes, int(tokens.pop(0)))
+                elif parameter == "time":
+                    set_table(times, int(tokens.pop(0)))
+                elif parameter == "score":
+                    kind = tokens.pop(0)
+                    value = encode_score(kind, int(tokens.pop(0)))
+
+                    is_bound = False
+                    if tokens and tokens[0] in ["lowerbound", "upperbound"]:
+                        is_bound = True
+                        tokens.pop(0)
+
+                    was_bound = depth is None or len(bound) < multipv or len(bound[multipv - 1]) <= depth or bound[multipv - 1][depth]
+                    set_table(bound, is_bound)
+
+                    if was_bound or not is_bound:
+                        set_table(scores, value)
+                elif parameter == "pv":
+                    set_table(pvs, " ".join(tokens))
+                    break
         else:
             logging.warning("Unexpected engine response to go: %s %s", command, arg)
 
@@ -558,7 +582,7 @@ class ProgressReporter(threading.Thread):
         try:
             self.queue.put_nowait((path, data))
         except queue.Full:
-            logging.debug("Could not keep up with progress reports. Dropping one.")
+            logging.debug("Could not keep up with progress reports. Progress reports are expendable. Dropping one.")
 
     def stop(self):
         while not self.queue.empty():
@@ -581,17 +605,20 @@ class ProgressReporter(threading.Thread):
                     logging.error("Too many requests. Suspending progress reports for 60s ...")
                     time.sleep(60.0)
                 elif response.status_code != 204:
-                    logging.error("Expected status 204 for progress report, got %d", response.status_code)
+                    logging.error("Expected status 204 for progress report, got %d. Progress reports are expandable.", response.status_code)
             except requests.RequestException as err:
-                logging.warning("Could not send progress report (%s). Continuing.", err)
+                logging.warning("Could not send progress report (%s). Progress reports are expendable. Continuing.", err)
 
 
 class Worker(threading.Thread):
-    def __init__(self, conf, threads, memory, progress_reporter):
+    def __init__(self, conf, threads, memory, user_backlog, system_backlog, progress_reporter):
         super(Worker, self).__init__()
         self.conf = conf
         self.threads = threads
         self.memory = memory
+        self.user_backlog = user_backlog
+        self.system_backlog = system_backlog
+        self.slow = MAX_BACKOFF
 
         self.progress_reporter = progress_reporter
 
@@ -610,9 +637,6 @@ class Worker(threading.Thread):
 
         self.job = None
         self.backoff = start_backoff(self.conf)
-        self.analysis_nodes = get_nodes(self.conf)
-        self.analysis_movetime = get_movetime(self.conf)
-        self.mongo = get_mongo_collection(self.conf)
 
         self.http = requests.Session()
         self.http.mount("http://", requests.adapters.HTTPAdapter(max_retries=1))
@@ -620,7 +644,8 @@ class Worker(threading.Thread):
 
     def set_name(self, name):
         self.name = name
-        self.progress_reporter.name = "%s (P)" % (name, )
+        if self.progress_reporter:
+            self.progress_reporter.name = "%s (P)" % (name, )
 
     def stop(self):
         with self.status_lock:
@@ -636,6 +661,12 @@ class Worker(threading.Thread):
     def is_alive(self):
         with self.status_lock:
             return self.alive
+
+    def report_and_fetch(self, path, result, params):
+        return self.http.post(get_endpoint(self.conf, path),
+                              params=params,
+                              json=result,
+                              timeout=HTTP_TIMEOUT)
 
     def run(self):
         try:
@@ -672,20 +703,32 @@ class Worker(threading.Thread):
             return
 
         try:
-            # Report result and fetch next job
-            response = self.http.post(get_endpoint(self.conf, path),
-                                      json=request,
-                                      timeout=HTTP_TIMEOUT)
+            # Determine extra wait time based on queue status
+            backlog_wait, slow = self.backlog_wait_time()
+
+            params = {}
+            if not self.is_alive() or backlog_wait > 0:
+                params["stop"] = "true"
+            if slow:
+                params["slow"] = "true"
+
+            # Report result and fetch next job unless stopping and no results to report
+            if "stop" in params and path == "acquire":
+                response = None
+            else:
+                response = self.report_and_fetch(path, request, params)
+
         except requests.RequestException as err:
             self.job = None
             t = next(self.backoff)
             logging.error("Backing off %0.1fs after failed request (%s)", t, err)
             self.sleep.wait(t)
         else:
-            if response.status_code == 204:
+            # Handle response.
+            if response is None or response.status_code == 204:
                 self.job = None
                 t = next(self.backoff)
-                logging.debug("No job found. Backing off %0.1fs", t)
+                logging.debug("No job received. Backing off %0.1fs", t)
                 self.sleep.wait(t)
             elif response.status_code == 202:
                 logging.debug("Got job: %s", response.text)
@@ -716,6 +759,48 @@ class Worker(threading.Thread):
                 t = next(self.backoff)
                 logging.error("Unexpected HTTP status for acquire: %d", response.status_code)
                 self.sleep.wait(t)
+
+            # Idle the client for some time.
+            if self.is_alive() and self.job is None and backlog_wait > 0:
+                if backlog_wait >= 120:
+                    logging.info("Going idle for %dm", round(backlog_wait / 60))
+                else:
+                    logging.log(logging.INFO if backlog_wait >= 10 else logging.DEBUG,
+                                "Going idle for %0.1fs", backlog_wait)
+                self.sleep.wait(backlog_wait)
+
+    def backlog_wait_time(self):
+        if not self.is_alive():
+            return 0, False
+
+        user_backlog = self.user_backlog + self.slow
+        if user_backlog >= 1 or self.system_backlog >= 1:
+            try:
+                response = self.http.get(get_endpoint(self.conf, "status"), timeout=HTTP_TIMEOUT)
+                if response.status_code == 200:
+                    status = response.json()
+                    user_oldest = max(0, status["analysis"]["user"]["oldest"])
+                    user_wait = max(0, user_backlog - user_oldest)
+                    system_oldest = max(0, status["analysis"]["system"]["oldest"])
+                    system_wait = max(0, self.system_backlog - system_oldest)
+                    logging.debug("User wait: %0.1fs due to %0.1fs for oldest %0.1fs, system wait: %0.1fs due to %0.1fs for oldest %0.1fs",
+                                  user_wait, user_backlog, user_oldest,
+                                  system_wait, self.system_backlog, system_oldest)
+                    slow = user_wait >= system_wait + 1.0
+                    return min(user_wait, system_wait), slow
+                elif response.status_code == 404:
+                    # Status deliberately not implemented (for example lila-fishnet)
+                    return 0, False
+                elif response.status_code == 429:
+                    logging.error("Too many requests while checking queue status. Waiting 60s ...")
+                    self.sleep.wait(60)
+                else:
+                    logging.error("Unexpected HTTP status while checking queue status: %d", response.status_code)
+            except requests.RequestException:
+                logging.error("Could not get status. Continuing.")
+            except KeyError:
+                logging.warning("Incompatible status response. Continuing.")
+        return 0, self.slow >= 1.0
 
     def abort_job(self):
         if self.job is None:
@@ -803,27 +888,6 @@ class Worker(threading.Thread):
 
             return "acquire", result
 
-    def get_cache(self, fen):
-        part = None
-        if self.mongo is not None:
-            eval = self.mongo.find_one({"_id": fen})
-            if eval is not None:
-                part = eval.get("p")
-                self.mongo.update_one({"_id": fen}, {'$inc': {'h': 1}})
-
-        return part
-
-    def set_cache(self, fen, part):
-        if self.mongo is not None:
-            logging.debug("Save position %s to cache", fen)
-            result = self.mongo.update_one({"_id": fen}, {'$set': {'p': part}})
-            if result.matched_count == 0:
-                self.mongo.insert_one({
-                    "_id": fen,
-                    "p": part,
-                    "h": 1
-                })
-
     def job_name(self, job, ply=None):
         builder = []
         if job.get("game_id"):
@@ -845,66 +909,73 @@ class Worker(threading.Thread):
                       self.job_name(job), variant, lvl)
 
         set_variant_options(self.stockfish, job.get("variant", "standard"))
-        setoption(self.stockfish, "Skill Level", LVL_SKILL[lvl - 1])
+        setoption(self.stockfish, "UCI_LimitStrength", lvl < 8)
+        setoption(self.stockfish, "UCI_Elo", LVL_ELO[lvl - 1])
         setoption(self.stockfish, "UCI_AnalyseMode", False)
+        setoption(self.stockfish, "MultiPV", 1)
         send(self.stockfish, "ucinewgame")
         isready(self.stockfish)
 
         movetime = int(round(LVL_MOVETIMES[lvl - 1] / (self.threads * 0.9 ** (self.threads - 1))))
 
         start = time.time()
-        part = go(self.stockfish, job["position"], moves,
-                  movetime=movetime, clock=job["work"].get("clock"),
-                  depth=LVL_DEPTHS[lvl - 1])
+        go(self.stockfish, job["position"], moves,
+           movetime=movetime, clock=job["work"].get("clock"),
+           depth=LVL_DEPTHS[lvl - 1])
+        bestmove = recv_bestmove(self.stockfish)
         end = time.time()
 
-        logging.log(PROGRESS, "Played move in %s (%s) with lvl %d: %0.3fs elapsed, depth %d",
+        logging.log(PROGRESS, "Played move in %s (%s) with lvl %d: %0.3fs elapsed",
                     self.job_name(job), variant,
-                    lvl, end - start, part.get("depth", 0))
+                    lvl, end - start)
 
-        self.nodes += part.get("nodes", 0)
+        self.slow = 0.1  # move clients are trusted to be fast
+
         self.positions += 1
 
         result = self.make_request()
         result["move"] = {
-            "bestmove": part["bestmove"],
+            "bestmove": bestmove,
         }
         return result
 
     def analysis(self, job):
         variant = job.get("variant", "standard")
         moves = job["moves"].split(" ")
-        fens = job.get("fens")
 
         result = self.make_request()
-        result["analysis"] = [None for _ in range(len(moves) + 1)]
         start = last_progress_report = time.time()
 
+        multipv = job.get("multipv")
+        skip = job.get("skipPositions", [])
+
         set_variant_options(self.stockfish, variant)
-        setoption(self.stockfish, "Skill Level", 20)
+        setoption(self.stockfish, "UCI_LimitStrength", False)
         setoption(self.stockfish, "UCI_AnalyseMode", True)
+        setoption(self.stockfish, "MultiPV", multipv or 1)
+
         send(self.stockfish, "ucinewgame")
         isready(self.stockfish)
 
-        nodes = job.get("nodes") or self.analysis_nodes
-        movetime = job.get("movetime") or self.analysis_movetime
-        if (movetime == -1):
-            movetime=None
-            logging.debug("Use FEN mode")
-
-        if fens is not None:
-            fens.insert(0, job["position"])
-        
-        skip = job.get("skipPositions", [])
+        if multipv is None:
+            result["analysis"] = [None for _ in range(len(moves) + 1)]
+        else:
+            result["analysis"] = {
+                "time": [[] for _ in range(len(moves) + 1)],
+                "nodes": [[] for _ in range(len(moves) + 1)],
+                "score": [[] for _ in range(len(moves) + 1)],
+                "pv": [[] for _ in range(len(moves) + 1)],
+            }
 
         num_positions = 0
 
         for ply in range(len(moves), -1, -1):
             if ply in skip:
-                result["analysis"][ply] = {"skipped": True}
+                if multipv is None:
+                    result["analysis"][ply] = {"skipped": True}
                 continue
 
-            if last_progress_report + PROGRESS_REPORT_INTERVAL < time.time():
+            if multipv is None and last_progress_report + PROGRESS_REPORT_INTERVAL < time.time():
                 if self.progress_reporter:
                     self.progress_reporter.send(job, result)
                 last_progress_report = time.time()
@@ -912,41 +983,137 @@ class Worker(threading.Thread):
             logging.log(PROGRESS, "Analysing %s: %s",
                         variant, self.job_name(job, ply))
 
-            if fens is None:
-                part = go(self.stockfish, job["position"], moves[0:ply], 
-                    nodes=nodes, movetime=movetime)
+            go(self.stockfish, job["position"], moves[0:ply],
+               nodes=job.get("nodes") or 3500000,
+               movetime=int(MAX_MOVE_TIME * 1000),
+               depth=job.get("depth"))
+            scores, nodes, times, pvs = recv_analysis(self.stockfish)
+
+            if multipv is None:
+                depth = len(scores[0]) - 1
+                result["analysis"][ply] = {
+                    "depth": depth,
+                    "score": decode_score(scores[0][depth]),
+                }
+                try:
+                    result["analysis"][ply]["nodes"] = n = nodes[0][depth]
+                    result["analysis"][ply]["time"] = t = times[0][depth]
+                    if t > 200:
+                        result["analysis"][ply]["nps"] = n * 1000 // t
+                except IndexError:
+                    pass
+                try:
+                    result["analysis"][ply]["pv"] = pvs[0][depth]
+                except IndexError:
+                    pass
             else:
-                part = self.get_cache(fens[ply])
-                if part is None:
-                    part = go(self.stockfish, fens[ply], None, 
-                        nodes=nodes, movetime=movetime)
+                result["analysis"]["time"][ply] = times
+                result["analysis"]["nodes"][ply] = nodes
+                result["analysis"]["score"][ply] = scores
+                result["analysis"]["pv"][ply] = pvs
 
-            if "mate" not in part["score"] and "time" in part and part["time"] < 100:
-                logging.warning("Very low time reported: %d ms.", part["time"])
-
-            if "nps" in part and part["nps"] >= 100000000:
-                logging.warning("Dropping exorbitant nps: %d", part["nps"])
-                del part["nps"]
-
-            if fens is not None:
-                self.set_cache(fens[ply], part)
-
-            self.nodes += part.get("nodes", 0)
+            try:
+                self.nodes += nodes[0][-1]
+            except IndexError:
+                pass
             self.positions += 1
             num_positions += 1
-
-            result["analysis"][ply] = part
 
         end = time.time()
 
         if num_positions:
-            logging.info("%s took %0.1fs (%0.2fs per position)",
+            t = (end - start) / num_positions
+            logging.info("%s took %0.1fs (%0.1fs per position)",
                          self.job_name(job),
-                         end - start, (end - start) / num_positions)
+                         end - start, t)
+            if t > 0.95 * MAX_MOVE_TIME * (multipv or 1):
+                logging.warning("Extremely slow (%0.1fs per position). If this happens frequently, it is better to stop and defer to clients with better hardware.", t)
+            elif t > TARGET_MOVE_TIME * (multipv or 1) + 0.1 and self.slow < MAX_SLOW_BACKOFF:
+                self.slow = min(self.slow * 2, MAX_SLOW_BACKOFF)
+                logging.info("Slower than %0.1fs per position (%0.1fs). Will accept only older user requests (backlog >= %0.1fs).", TARGET_MOVE_TIME, t, self.slow)
+            elif t < TARGET_MOVE_TIME * (multipv or 1) - 0.1 and self.slow > 0.1:
+                self.slow = max(self.slow / 2, 0.1)
+                if self.is_alive() and self.slow > 0.5:
+                    logging.info("Nice, faster than %0.1fs per position (%0.1fs)! Will accept younger user requests (backlog >= %0.1fs).", TARGET_MOVE_TIME, t, self.slow)
+                else:
+                    logging.debug("Nice, faster than %0.1fs per position (%0.1fs)! More confident in performance (backlog >= %0.1fs).", TARGET_MOVE_TIME, t, self.slow)
         else:
             logging.info("%s done (nothing to do)", self.job_name(job))
 
         return result
+
+
+class BenchmarkWorker(Worker):
+    def __init__(self, conf, threads, memory):
+        super(BenchmarkWorker, self).__init__(
+            conf, threads, memory, user_backlog=0, system_backlog=0, progress_reporter=None)
+
+        # Make sure BenchmarkWorker doesn't make http requests
+        self.http = None
+
+        self.started_analysis = threading.Event()
+        self.time_running = 0.0
+
+    def abort_job(self):
+        self.job = None
+        return
+
+    def backlog_wait_time(self):
+        return 0, False
+
+    def analysis(self, job):
+        self.started_analysis.set()
+
+        # Add timing for benchmarking
+        start = time.time()
+        super(BenchmarkWorker, self).analysis(job)
+        end = time.time()
+        self.time_running += end - start
+
+    def report_and_fetch(self, path, result, params):
+        # Fake response from a small set of random positions
+        game_id, moves = random.choice([
+            (
+                "RzXDxLUD",
+                "d2d4 g8f6 c2c4 e7e6 b1c3 d7d5 c4d5 e6d5 c1g5 c7c6 e2e3 f8e7 f1d3 e8g8 g1e2 c8d7 "
+                "e1g1 h7h6 g5h4 d7e6 f2f3 b8d7 g1h1 f8e8 d1d2 f6e4 f3e4 e7h4 e4e5 h4g5 e2f4 d7f8 "
+                "d2f2 d8e7 a1e1 f7f6 h2h4 g5f4 e3f4 f6f5 g2g4 e7f7 f1g1 g8h8 c3d1 f8g6 d1e3 g6e7 "
+                "e1f1 e8f8 f2h2 c6c5 h4h5 c5d4 e3c2 f5g4 f4f5 e6f5 c2d4 f5d3 f1f7 d3e4 f7f3 g4f3 "
+                "h2f2 f8f4 h1h2 a8f8 d4e6 f4f5 e6f8 f5h5 h2g3 e7f5 g3f4 g7g5 f4g4 h5h4 f2h4 f5h4 "
+                "e5e6 h8g7 e6e7 g7f7 f8d7 f7e7 d7e5 h4f5 e5f3 f5e3 g4g3 e3c4 g3f2 e7d6 f3d4 h6h5 "
+                "d4e2 h5h4 g1g5 d5d4 g5h5 d4d3 h5h6 d6e5 e2c3 e5d4 h6h5 e4f5 h5h4 f5e4 h4e4 d4c5 "
+                "e4e5 c5b4 e5e4 b4a5 e4c4 b7b6 c4a4",
+            ), (
+                "KU8R1KDQ",
+                "e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 c2c3 g8f6 d2d4 e5d4 c3d4 c5b4 b1d2 f6e4 e1g1 d7d5 "
+                "d2e4 d5c4 d4d5 c6e7 d1a4 c7c6 a4b4 e7d5 e4d6 e8d7 b4a3 d8e7 f3e5 d7c7 e5f7 h8f8 "
+                "c1g5 e7d7 d6b5 c6b5 a3f8 d7e6 f8d8 c7c6 f7d6 e6d6 d8e8 d6d7 e8g8 d7f5 g5h4 d5c7 "
+                "h4g3 c8e6 g8g7 c7d5 f1e1 a8g8 g7h6 g8e8 e1e5 f5g6 h6d2 e8d8 a1e1 e6f7 d2a5 d8d7 "
+                "a5a7 g6c2 a7b8 c2b2 e5d5 c6d5 h2h3 c4c3 e1e5 d5d4 b8a7 d4d3 e5e3 d3c2 g1h2 c2b1 "
+                "e3e1 b1c2 e1e2 d7d2 a7e3 f7g6 e2e1 b2a2 g3e5 a2c4 e5c3 c4c3 e1c1 c2c1 e3c3 d2c2 "
+                "c3a1 c1d2 h2g3 d2d3 g3h2 c2c3 a1a3 d3d4 a3a5 b5b4 a5a6 b7a6 h3h4 b4b3 g2g3 b3b2",
+            ),
+        ])
+
+        encoded = json.dumps(
+            {
+                "work": {
+                    "type": "analysis",
+                    "id": "BENCHMARK"
+                },
+                "nodes": 4000000,
+                "skipPositions": [0,1,2,3,4,5,6,],
+                "game_id": game_id,
+                "position": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                "variant": "standard",
+                "moves": moves,
+            }
+        )
+
+        response = requests.models.Response()
+        response.status_code = 202
+        response._content = encoded.encode()
+        return response
 
 
 def detect_cpu_capabilities():
@@ -1046,6 +1213,8 @@ def download_github_release(conf, release_page, filename):
     if response.status_code == 304:
         logging.info("Local %s is newer than release", filename)
         return filename
+    elif response.status_code != 200:
+        raise ConfigError("Failed to look up latest Stockfish release (status %d)" % (response.status_code, ))
 
     release = response.json()
 
@@ -1182,13 +1351,13 @@ def load_conf(args):
 
     if not args.no_conf:
         if not args.conf and not os.path.isfile(DEFAULT_CONFIG):
-            return configure(args)
+            conf = configure(args)
+        else:
+            config_file = args.conf or DEFAULT_CONFIG
+            logging.debug("Using config file: %s", config_file)
 
-        config_file = args.conf or DEFAULT_CONFIG
-        logging.debug("Using config file: %s", config_file)
-
-        if not conf.read(config_file):
-            raise ConfigError("Could not read config file: %s" % config_file)
+            if not conf.read(config_file):
+                raise ConfigError("Could not read config file: %s" % config_file)
 
     if hasattr(args, "engine_dir") and args.engine_dir is not None:
         conf.set("Fishnet", "EngineDir", args.engine_dir)
@@ -1198,20 +1367,18 @@ def load_conf(args):
         conf.set("Fishnet", "Key", args.key)
     if hasattr(args, "cores") and args.cores is not None:
         conf.set("Fishnet", "Cores", args.cores)
-    if hasattr(args, "nodes") and args.nodes is not None:
-        conf.set("Fishnet", "Nodes", args.nodes)
-    if hasattr(args, "movetime") and args.movetime is not None:
-        conf.set("Fishnet", "MoveTime", args.movetime)
     if hasattr(args, "memory") and args.memory is not None:
         conf.set("Fishnet", "Memory", args.memory)
-    if hasattr(args, "threads") and args.threads is not None:
-        conf.set("Fishnet", "Threads", str(args.threads))
+    if hasattr(args, "threads_per_process") and args.threads_per_process is not None:
+        conf.set("Fishnet", "ThreadsPerProcess", str(args.threads_per_process))
     if hasattr(args, "endpoint") and args.endpoint is not None:
         conf.set("Fishnet", "Endpoint", args.endpoint)
     if hasattr(args, "fixed_backoff") and args.fixed_backoff is not None:
         conf.set("Fishnet", "FixedBackoff", str(args.fixed_backoff))
-    if hasattr(args, "mongodb") and args.mongodb is not None:
-        conf.set("Fishnet", "MongoDB", str(args.mongodb))
+    if hasattr(args, "user_backlog") and args.user_backlog is not None:
+        conf.set("Fishnet", "UserBacklog", args.user_backlog)
+    if hasattr(args, "system_backlog") and args.system_backlog is not None:
+        conf.set("Fishnet", "SystemBacklog", args.system_backlog)
     for option_name, option_value in args.setoption:
         conf.set("Stockfish", option_name.lower(), option_value)
 
@@ -1269,8 +1436,12 @@ def configure(args):
         os.remove(config_file)
 
     # Stockfish working directory
-    engine_dir = config_input("Engine working directory (default: %s): " % os.path.abspath("."),
-                              validate_engine_dir, out)
+    if args.engine_dir is None:
+        engine_dir = config_input("Engine working directory (default: %s): " % os.path.abspath("."),
+                                  validate_engine_dir, out)
+    else:
+        engine_dir = validate_engine_dir(args.engine_dir)
+        print("Engine working directory: %s" % engine_dir, file=out)
     conf.set("Fishnet", "EngineDir", engine_dir)
 
     # Stockfish command
@@ -1282,9 +1453,13 @@ def configure(args):
     print("You can build lichess.org custom Stockfish yourself and provide", file=out)
     print("the path or automatically download a precompiled binary.", file=out)
     print(file=out)
-    stockfish_command = config_input("Path or command (will download by default): ",
-                                     lambda v: validate_stockfish_command(v, conf),
-                                     out)
+    if args.stockfish_command is None:
+        stockfish_command = config_input("Path or command (will download by default): ",
+                                         lambda v: validate_stockfish_command(v, conf),
+                                         out)
+    else:
+        stockfish_command = validate_stockfish_command(args.stockfish_command, conf)
+        print("Path or command: %s" % stockfish_command, file=out)
     if not stockfish_command:
         conf.remove_option("Fishnet", "StockfishCommand")
     else:
@@ -1292,39 +1467,64 @@ def configure(args):
     print(file=out)
 
     # Cores
-    max_cores = multiprocessing.cpu_count()
-    default_cores = max(1, max_cores - 1)
-    cores = config_input("Number of cores to use for engine threads (default %d, max %d): " % (default_cores, max_cores),
-                         validate_cores, out)
+    if args.cores is None:
+        max_cores = multiprocessing.cpu_count()
+        default_cores = max(1, max_cores - 1)
+        cores = config_input("Number of cores to use for engine threads (default %d, max %d): " % (default_cores, max_cores),
+                             validate_cores, out)
+    else:
+        cores = validate_cores(args.cores)
+        print("Number of cores to use for engine threads: %d" % cores, file=out)
     conf.set("Fishnet", "Cores", str(cores))
 
-    nodes = config_input("Analysis node limit (default 3500000): ", validate_nodes, out)
-    conf.set("Fishnet", "Nodes", str(nodes))
-
-    movetime = config_input("Analysis movetime limit (-1 for unlimited, default 4000): ", validate_movetime, out)
-    conf.set("Fishnet", "MoveTime", str(movetime))
+    # Backlog
+    if args.user_backlog is None and args.system_backlog is None:
+        print(file=out)
+        print("You can choose to join only if a backlog is building up. Examples:", file=out)
+        print("* Rented server exlusively for fishnet: choose no", file=out)
+        print("* Running on laptop: choose yes", file=out)
+        if config_input("Would you prefer to keep your client idle? (default: no) ", parse_bool, out):
+            conf.set("Fishnet", "UserBacklog", "short")
+            conf.set("Fishnet", "SystemBacklog", "long")
+        else:
+            conf.set("Fishnet", "UserBacklog", "0s")
+            conf.set("Fishnet", "SystemBacklog", "0s")
+        print(file=out)
+    else:
+        print("Using custom backlog parameters.", file=out)
+        if args.user_backlog is not None:
+            parse_duration(args.user_backlog)
+            conf.set("Fishnet", "UserBacklog", args.user_backlog)
+        if args.system_backlog is not None:
+            parse_duration(args.system_backlog)
+            conf.set("Fishnet", "SystemBacklog", args.system_backlog)
 
     # Advanced options
-    endpoint = args.endpoint or DEFAULT_ENDPOINT
-    connstr = ""
-    if config_input("Configure advanced options? (default: no) ", parse_bool, out):
-        endpoint = config_input("Fishnet API endpoint (default: %s): " % (endpoint, ), lambda inp: validate_endpoint(inp, endpoint), out)
-        connstr = config_input("MongoDB connection string (default: none): ", validate_mongo, out)
-
+    if args.endpoint is None:
+        if config_input("Configure advanced options? (default: no) ", parse_bool, out):
+            endpoint = config_input("Fishnet API endpoint (default: %s): " % DEFAULT_ENDPOINT, validate_endpoint, out)
+        else:
+            endpoint = DEFAULT_ENDPOINT
+    else:
+        endpoint = validate_endpoint(args.endpoint)
+        print("Fishnet API endpoint: %s" % endpoint, file=out)
     conf.set("Fishnet", "Endpoint", endpoint)
-    conf.set("Fishnet", "MongoDB", connstr)
 
     # Change key?
-    key = None
-    if conf.has_option("Fishnet", "Key"):
-        if not config_input("Change fishnet key? (default: no) ", parse_bool, out):
-            key = conf.get("Fishnet", "Key")
+    if args.key is None:
+        key = None
+        if conf.has_option("Fishnet", "Key"):
+            if not config_input("Change fishnet key? (default: no) ", parse_bool, out):
+                key = conf.get("Fishnet", "Key")
 
-    # Key
-    if key is None:
-        status = "https://lichess.org/get-fishnet" if is_production_endpoint(conf) else "probably not required"
-        key = config_input("Personal fishnet key (append ! to force, %s): " % status,
-                           lambda v: validate_key(v, conf, network=True), out)
+        # Key
+        if key is None:
+            status = "https://lichess.org/get-fishnet" if is_production_endpoint(conf) else "probably not required"
+            key = config_input("Personal fishnet key (append ! to force, %s): " % status,
+                               lambda v: validate_key(v, conf, network=True), out)
+    else:
+        key = validate_key(args.key, conf, network=True)
+        print("Personal fishnet key: %s" % (("*" * len(key) or "(none)", )), file=out)
     conf.set("Fishnet", "Key", key)
     logging.getLogger().addFilter(CensorLogFilter(key))
 
@@ -1390,27 +1590,43 @@ def parse_bool(inp, default=False):
     elif inp in ["n", "no", "nop", "nope", "f", "false", "0"]:
         return False
     else:
-        raise ConfigError("Not a boolean value: %s", inp)
+        raise ConfigError("Not a boolean value: %s" % (inp, ))
 
-def validate_nodes(nodes):
-    if not nodes or not nodes.strip():
-        return 3500000
+
+def parse_duration(inp, default=0):
+    if not inp:
+        return default
+
+    stripped = inp.strip().lower()
+    if not stripped:
+        return default
+    elif stripped == "short":
+        return 60
+    elif stripped == "long":
+        return 60 * 60
+
+    factor = 1
+    if stripped.endswith("s"):
+        stripped = stripped[:-1].rstrip()
+    elif inp.endswith("m"):
+        factor = 60
+        stripped = stripped[:-1].rstrip()
+    elif inp.endswith("h"):
+        factor = 60 * 60
+        stripped = stripped[:-1].rstrip()
+    elif inp.endswith("d"):
+        factor = 60 * 60 * 24
+        stripped = stripped[:-1].rstrip()
+
     try:
-        nodes = int(nodes.strip())
+        return int(stripped) * factor
     except ValueError:
-        raise ConfigError("Number of nodes must be an integer")
+        raise ConfigError("Not a valid duration: %s" % (inp, ))
 
-    return nodes
 
-def validate_movetime(movetime):
-    if not movetime or not movetime.strip():
-        return 4000
-    try:
-        movetime = int(movetime.strip())
-    except ValueError:
-        raise ConfigError("Number of movetime must be an integer")
+def validate_backlog(conf):
+    return parse_duration(conf_get(conf, "UserBacklog")), parse_duration(conf_get(conf, "SystemBacklog"))
 
-    return movetime
 
 def validate_cores(cores):
     if not cores or cores.strip().lower() == "auto":
@@ -1433,7 +1649,7 @@ def validate_cores(cores):
     return cores
 
 
-def validate_threads(threads, conf):
+def validate_threads_per_process(threads, conf):
     cores = validate_cores(conf_get(conf, "Cores"))
 
     if not threads or str(threads).strip().lower() == "auto":
@@ -1455,7 +1671,7 @@ def validate_threads(threads, conf):
 
 def validate_memory(memory, conf):
     cores = validate_cores(conf_get(conf, "Cores"))
-    threads = validate_threads(conf_get(conf, "Threads"), conf)
+    threads = validate_threads_per_process(conf_get(conf, "ThreadsPerProcess"), conf)
     processes = cores // threads
 
     if not memory or not memory.strip() or memory.strip().lower() == "auto":
@@ -1474,10 +1690,6 @@ def validate_memory(memory, conf):
 
     return memory
 
-def validate_mongo(conn_str):
-    if not conn_str or not conn_str.strip():
-        return ""
-    return conn_str.strip()
 
 def validate_endpoint(endpoint, default=DEFAULT_ENDPOINT):
     if not endpoint or not endpoint.strip():
@@ -1530,21 +1742,16 @@ def conf_get(conf, key, default=None, section="Fishnet"):
 def get_engine_dir(conf):
     return validate_engine_dir(conf_get(conf, "EngineDir"))
 
-def get_nodes(conf):
-    return validate_nodes(conf_get(conf, "Nodes"))
-
-def get_movetime(conf):
-    return validate_movetime(conf_get(conf, "MoveTime"))
 
 def get_stockfish_command(conf, update=True):
     stockfish_command = validate_stockfish_command(conf_get(conf, "StockfishCommand"), conf)
-    if not stockfish_command:
-        filename = stockfish_filename()
-        if update:
-            filename = update_stockfish(conf, filename)
-        return validate_stockfish_command(os.path.join(".", filename), conf)
-    else:
+    if stockfish_command:
         return stockfish_command
+
+    filename = stockfish_filename()
+    if update:
+        filename = update_stockfish(conf, filename)
+    return validate_stockfish_command(os.path.join(".", filename), conf)
 
 
 def get_endpoint(conf, sub=""):
@@ -1571,15 +1778,6 @@ def start_backoff(conf):
             yield 0.5 * backoff + 0.5 * backoff * random.random()
             backoff = min(backoff + 1, MAX_BACKOFF)
 
-def get_mongo_collection(conf):
-    collection = None
-    connStr = validate_mongo(conf_get(conf, "MongoDB"))
-    if connStr and connStr.strip():
-        logging.debug("Try connect to MongoDB: %s", connStr)
-        client = MongoClient(connStr)
-        db = client.fishnet
-        collection = db.analysis
-    return collection
 
 def update_available():
     try:
@@ -1598,21 +1796,21 @@ def update_available():
         return True
 
 
-def cmd_run(args):
-    conf = load_conf(args)
-
-    if args.auto_update:
-        print()
-        print("### Updating ...")
-        print()
-        update_self()
-
+def update_config(conf):
+    '''Update conf by checking for newer stockfish release'''
     stockfish_command = validate_stockfish_command(conf_get(conf, "StockfishCommand"), conf)
     if not stockfish_command:
         print()
         print("### Updating Stockfish ...")
         print()
         stockfish_command = get_stockfish_command(conf)
+
+
+def display_config(args, conf):
+    '''Display args and conf settings'''
+
+    # Don't call validate here as stockfish should be validated from update_config.
+    stockfish_command = conf_get(conf, "StockfishCommand")
 
     print()
     print("### Checking configuration ...")
@@ -1625,7 +1823,7 @@ def cmd_run(args):
     cores = validate_cores(conf_get(conf, "Cores"))
     print("Cores:            %d" % cores)
 
-    threads = validate_threads(conf_get(conf, "Threads"), conf)
+    threads = validate_threads_per_process(conf_get(conf, "ThreadsPerProcess"), conf)
     instances = max(1, cores // threads)
     print("Engine processes: %d (each ~%d threads)" % (instances, threads))
     memory = validate_memory(conf_get(conf, "Memory"), conf)
@@ -1633,6 +1831,9 @@ def cmd_run(args):
     endpoint = get_endpoint(conf)
     warning = "" if endpoint.startswith("https://") else " (WARNING: not using https)"
     print("Endpoint:         %s%s" % (endpoint, warning))
+    user_backlog, system_backlog = validate_backlog(conf)
+    print("UserBacklog:      %ds" % user_backlog)
+    print("SystemBacklog:    %ds" % system_backlog)
     print("FixedBackoff:     %s" % parse_bool(conf_get(conf, "FixedBackoff")))
     print()
 
@@ -1648,7 +1849,107 @@ def cmd_run(args):
             print(" * %s = %s%s" % (name, value, hint))
         print()
 
-    print("### Starting workers ...")
+    if args.ignored_threads:
+        print("Ignored deprecated option --threads. Did you mean --cores?")
+        print()
+
+    return cores, threads, instances, memory, user_backlog, system_backlog
+
+
+def cmd_benchmark(args):
+    conf = load_conf(args)
+    update_config(conf)
+    cores, threads, instances, memory, _, _ = display_config(args, conf)
+
+    buckets = [0] * instances
+    for i in range(0, cores):
+        buckets[i % instances] += 1
+
+    instance_memory = memory // instances
+    workers = [BenchmarkWorker(conf, bucket, instance_memory) for bucket in buckets]
+
+    logging.info("Starting %d workers" % len(workers))
+
+    # Start all threads
+    for i, worker in enumerate(workers):
+        worker.set_name("><> %d" % (i + 1))
+        worker.setDaemon(True)
+        worker.start()
+
+    for worker in workers:
+        if not worker.started_analysis.wait(1):
+            logging.warning("Worker %s never started", worker.name)
+
+    logging.info("All workers started")
+
+    finished = False
+    try:
+        # Let SIGTERM and SIGINT gracefully terminate the program
+        handler = SignalHandler()
+
+        # Stop workers after job finishes
+        for worker in workers:
+            worker.stop_soon()
+
+        # Wait for jobs to finish
+        for worker in workers:
+            logging.info("Waiting on worker %s to finish" % worker.name)
+            if not worker.finished.wait(4 * 100):
+                logging.warning("Timed out waiting for worker %s to finish", worker.name)
+
+        # Log stats
+        logging.info("[fishnet v%s] Analyzed %d positions, crunched %d million nodes",
+                     __version__,
+                     sum(worker.positions for worker in workers),
+                     int(sum(worker.nodes for worker in workers) / 1000 / 1000))
+        for worker in workers:
+            if worker.fatal_error:
+                raise worker.fatal_error
+            if worker.nodes and worker.time_running:
+                logging.info("[Worker %s] %d knodes / %.1f seconds = %.0f knps",
+                    worker.name,
+                    int(worker.nodes / 1000),
+                    worker.time_running,
+                    worker.nodes / 1000.0 / worker.time_running)
+
+        # Finished Benchmark
+        finished = True
+
+    except (Shutdown, ShutdownSoon):
+        logging.info("\n\n### Stopping benchmark early!")
+    finally:
+        handler.ignore = True
+
+        logging.info("Benchmark cleanup!")
+
+        # Stop workers
+        for worker in workers:
+            worker.stop()
+
+        # Wait
+        for worker in workers:
+            worker.finished.wait()
+
+    # Print final stats
+    if finished:
+        logging.info("Benchmark finished!")
+
+    return 0
+
+def cmd_run(args):
+    conf = load_conf(args)
+
+    if args.auto_update:
+        print()
+        print("### Updating ...")
+        print()
+        update_self()
+
+    update_config(conf)
+    cores, threads, instances, memory, user_backlog, system_backlog = \
+        display_config(args, conf)
+
+    print("### Starting workers (press Ctrl + C to stop) ...")
     print()
 
     buckets = [0] * instances
@@ -1659,7 +1960,7 @@ def cmd_run(args):
     progress_reporter.setDaemon(True)
     progress_reporter.start()
 
-    workers = [Worker(conf, bucket, memory // instances, progress_reporter) for bucket in buckets]
+    workers = [Worker(conf, bucket, memory // instances, user_backlog, system_backlog, progress_reporter) for bucket in buckets]
 
     # Start all threads
     for i, worker in enumerate(workers):
@@ -1737,28 +2038,51 @@ def cmd_configure(args):
 def cmd_systemd(args):
     conf = load_conf(args)
 
-    template = textwrap.dedent("""\
-        [Unit]
-        Description=Fishnet instance
-        After=network-online.target
-        Wants=network-online.target
+    if args.command == "systemd-user":
+        template = textwrap.dedent("""\
+            [Unit]
+            Description=Fishnet client
+            After=network-online.target
+            Wants=network-online.target
 
-        [Service]
-        ExecStart={start}
-        WorkingDirectory={cwd}
-        User={user}
-        Group={group}
-        Nice=5
-        CapabilityBoundingSet=
-        PrivateTmp=true
-        PrivateDevices=true
-        DevicePolicy=closed
-        ProtectSystem={protect_system}
-        NoNewPrivileges=true
-        Restart=always
+            [Service]
+            ExecStart={start}
+            KillMode=mixed
+            WorkingDirectory={cwd}
+            ReadWriteDirectories={cwd}
+            Nice=5
+            PrivateTmp=true
+            DevicePolicy=closed
+            ProtectSystem={protect_system}
+            Restart=always
 
-        [Install]
-        WantedBy=multi-user.target""")
+            [Install]
+            WantedBy=default.target""")
+    else:
+        template = textwrap.dedent("""\
+            [Unit]
+            Description=Fishnet client
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            ExecStart={start}
+            KillMode=mixed
+            WorkingDirectory={cwd}
+            ReadWriteDirectories={cwd}
+            User={user}
+            Group={group}
+            Nice=5
+            CapabilityBoundingSet=
+            PrivateTmp=true
+            PrivateDevices=true
+            DevicePolicy=closed
+            ProtectSystem={protect_system}
+            NoNewPrivileges=true
+            Restart=always
+
+            [Install]
+            WantedBy=multi-user.target""")
 
     # Prepare command line arguments
     builder = [shell_quote(sys.executable)]
@@ -1791,14 +2115,20 @@ def cmd_systemd(args):
     if args.memory is not None:
         builder.append("--memory")
         builder.append(shell_quote(str(validate_memory(args.memory, conf))))
-    if args.threads is not None:
+    if args.threads_per_process is not None:
         builder.append("--threads-per-process")
-        builder.append(shell_quote(str(validate_threads(args.threads, conf))))
+        builder.append(shell_quote(str(validate_threads_per_process(args.threads_per_process, conf))))
     if args.endpoint is not None:
         builder.append("--endpoint")
         builder.append(shell_quote(validate_endpoint(args.endpoint)))
     if args.fixed_backoff is not None:
         builder.append("--fixed-backoff" if args.fixed_backoff else "--no-fixed-backoff")
+    if args.user_backlog is not None:
+        builder.append("--user-backlog")
+        builder.append("%ds" % parse_duration(args.user_backlog))
+    if args.system_backlog is not None:
+        builder.append("--system-backlog")
+        builder.append("%ds" % parse_duration(args.system_backlog))
     for option_name, option_value in args.setoption:
         builder.append("--setoption")
         builder.append(shell_quote(option_name))
@@ -1831,11 +2161,20 @@ def cmd_systemd(args):
 
     if sys.stdout.isatty():
         print("\n# Example usage:", file=sys.stderr)
-        print("# python -m fishnet systemd | sudo tee /etc/systemd/system/fishnet.service", file=sys.stderr)
-        print("# sudo systemctl enable fishnet.service", file=sys.stderr)
-        print("# sudo systemctl start fishnet.service", file=sys.stderr)
-        print("#", file=sys.stderr)
-        print("# Live view of the log: sudo journalctl --follow -u fishnet", file=sys.stderr)
+        if args.command == "systemd-user":
+            print("# python -m fishnet systemd-user | tee ~/.config/systemd/user/fishnet.service", file=sys.stderr)
+            print("# systemctl enable --user fishnet.service", file=sys.stderr)
+            print("# systemctl start --user fishnet.service", file=sys.stderr)
+            print("#", file=sys.stderr)
+            print("# Live view of log: journalctl --follow --user-unit fishnet", file=sys.stderr)
+        else:
+            print("# python -m fishnet systemd | sudo tee /etc/systemd/system/fishnet.service", file=sys.stderr)
+            print("# sudo systemctl enable fishnet.service", file=sys.stderr)
+            print("# sudo systemctl start fishnet.service", file=sys.stderr)
+            print("#", file=sys.stderr)
+            print("# Live view of the log: sudo journalctl --follow -u fishnet", file=sys.stderr)
+            print("#", file=sys.stderr)
+            print("# Need a user unit? python -m fishnet systemd-user", file=sys.stderr)
 
 
 @contextlib.contextmanager
@@ -1986,7 +2325,7 @@ def main(argv):
     parser.add_argument("--version", action="version", version="fishnet v{0}".format(__version__))
 
     g = parser.add_argument_group("configuration")
-    g.add_argument("--auto-update", action="store_true", help="automatically install available updates")
+    g.add_argument("--auto-update", action="store_true", help="automatically install available updates on startup and at random intervals")
     g.add_argument("--conf", help="configuration file")
     g.add_argument("--no-conf", action="store_true", help="do not use a configuration file")
     g.add_argument("--key", "--apikey", "-k", help="fishnet api key")
@@ -1998,29 +2337,40 @@ def main(argv):
     g = parser.add_argument_group("advanced")
     g.add_argument("--endpoint", help="your chess server http endpoint (default: %s)" % DEFAULT_ENDPOINT)
     g.add_argument("--engine-dir", help="engine working directory")
-    g.add_argument("--stockfish-command", help="stockfish command (default: download precompiled Stockfish)")
-    g.add_argument("--threads-per-process", "--threads", type=int, dest="threads", help="hint for the number of threads to use per engine process (default: 4)")
-    g.add_argument("--fixed-backoff", action="store_true", default=None, help="fixed backoff (only recommended for move servers)")
+    g.add_argument("--stockfish-command", help="stockfish command (default: download latest precompiled Stockfish)")
+    g.add_argument("--threads-per-process", type=int, help="hint for the number of threads to use per engine process (default: %d)" % DEFAULT_THREADS)
+    g.add_argument("--user-backlog", type=str, help="prefer to run high-priority jobs only if older than this duration (for example 120s)")
+    g.add_argument("--system-backlog", type=str, help="prefer to run low-priority jobs only if older than this duration (for example 2h)")
+    g.add_argument("--fixed-backoff", action="store_true", default=None, help="only for developers: do not use exponential backoff")
     g.add_argument("--no-fixed-backoff", dest="fixed_backoff", action="store_false", default=None)
-    g.add_argument("--setoption", "-o", nargs=2, action="append", default=[], metavar=("NAME", "VALUE"), help="set a custom uci option")
+    g.add_argument("--setoption", "-o", nargs=2, action="append", default=[], metavar=("NAME", "VALUE"), help="only for developers: set a custom uci option")
+    g.add_argument("--threads", type=int, dest="ignored_threads", help=argparse.SUPPRESS)  # bc
 
     commands = collections.OrderedDict([
         ("run", cmd_run),
         ("configure", cmd_configure),
+        ("benchmark", cmd_benchmark),
         ("systemd", cmd_systemd),
+        ("systemd-user", cmd_systemd),
         ("cpuid", cmd_cpuid),
     ])
 
     parser.add_argument("command", default="run", nargs="?", choices=commands.keys())
 
+    try:
+        import argcomplete
+    except ImportError:
+        pass
+    else:
+        argcomplete.autocomplete(parser)
     args = parser.parse_args(argv[1:])
 
     # Setup logging
     setup_logging(args.verbose,
-                  sys.stderr if args.command == "systemd" else sys.stdout)
+                  sys.stderr if args.command in ["systemd", "systemd-user"] else sys.stdout)
 
     # Show intro
-    if args.command not in ["systemd", "cpuid"]:
+    if args.command not in ["systemd", "systemd-user", "cpuid"]:
         print(intro())
         sys.stdout.flush()
 

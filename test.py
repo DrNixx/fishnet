@@ -25,13 +25,14 @@ class WorkerTest(unittest.TestCase):
         conf = configparser.ConfigParser()
         conf.add_section("Fishnet")
         conf.set("Fishnet", "Key", "testkey")
-        conf.set("Fishnet", "MongoDB", "mongodb://localhost:27017/")
 
         fishnet.get_stockfish_command(conf, update=True)
 
         self.worker = fishnet.Worker(conf,
             threads=multiprocessing.cpu_count(),
             memory=32,
+            user_backlog=0,
+            system_backlog=0,
             progress_reporter=None)
         self.worker.start_stockfish()
 
@@ -146,6 +147,16 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(fishnet.parse_bool("no"), False)
         self.assertEqual(fishnet.parse_bool(""), False)
         self.assertEqual(fishnet.parse_bool("", default=True), True)
+
+    def test_parse_duration(self):
+        self.assertEqual(fishnet.parse_duration("1m"), 60)
+        self.assertEqual(fishnet.parse_duration("2 s"), 2)
+
+    def test_encode_score(self):
+        self.assertEqual(fishnet.decode_score(fishnet.encode_score("cp", 42)), {"cp": 42})
+        self.assertEqual(fishnet.decode_score(fishnet.encode_score("mate", -1)), {"mate": -1})
+        self.assertEqual(fishnet.decode_score(fishnet.encode_score("mate", 0)), {"mate": 0})
+        self.assertEqual(fishnet.decode_score(fishnet.encode_score("mate", 1)), {"mate": 1})
 
 
 if __name__ == "__main__":
