@@ -14,7 +14,7 @@ POST http://lichess.org/fishnet/acquire
     "python": "2.7.11+",
     "apikey": "XXX"
   },
-  "engine": {
+  "stockfish": {
     "name": "Stockfish 7 64",
     "options": {
       "hash": "256",
@@ -24,8 +24,10 @@ POST http://lichess.org/fishnet/acquire
 }
 ```
 
+Response with work:
+
 ```javascript
-200 OK
+202 OK
 
 {
   "work": {
@@ -47,6 +49,12 @@ POST http://lichess.org/fishnet/acquire
 }
 ```
 
+Response with no work found:
+
+```
+204 No Content
+```
+
 Client runs Stockfish and sends the analysis to server.
 The client can optionally report progress to the server, by sending null for
 the pending moves in `analysis`.
@@ -60,7 +68,7 @@ POST http://lichess.org/fishnet/analysis/{work_id}
     "python": "2.7.11+",
     "apikey": "XXX"
   },
-  "engine": {
+  "stockfish": {
     "name": "Stockfish 7 64",
     "author": "T. Romstad, M. Costalba, J. Kiiski, G. Linscott"
     "options": {
@@ -118,7 +126,7 @@ POST http://lichess.org/fishnet/move/{work_id}
     "python": "2.7.11+",
     "apikey": "XXX"
   },
-  "engine": {
+  "stockfish": {
     "name": "Stockfish 7 64",
     "author": "T. Romstad, M. Costalba, J. Kiiski, G. Linscott"
     "options": {
@@ -129,6 +137,12 @@ POST http://lichess.org/fishnet/move/{work_id}
   "bestmove": "b7b8q"
 }
 ```
+
+Query parameters:
+
+* `?slow=true`: Do not acquire user requested analysis. Speed is not important
+  for system requested analysis.
+* `?stop=true`: Submit result. Do not acquire next job.
 
 Accepted:
 
@@ -160,7 +174,7 @@ POST http://lichess.org/fishnet/abort/{work_id}
     "python": "2.7.11+",
     "apikey": "XXX"
   },
-  "engine": {
+  "stockfish": {
     "name": "Stockfish 7 64",
     "author": "T. Romstad, M. Costalba, J. Kiiski, G. Linscott"
     "options": {
@@ -175,4 +189,60 @@ Response:
 
 ```
 204 No Content
+```
+
+Status
+------
+
+Useful to monitor and react to queue status or spawn spot instances.
+
+```
+GET http://lichess.org/fishnet/status
+```
+
+```javascript
+200 OK
+
+{
+  "analysis": {
+    "user": { // User requested analysis (respond as soon as possible)
+      "acquired": 93, // Number of jobs that are currently assigned to clients
+      "queued": 1, // Number of jobs waiting to be assigned
+      "oldest": 5 // Age in seconds of oldest job in queue
+    },
+    "system": { // System requested analysis (for example spot check for cheat
+                // screening, low priority, queue may build up during peak time
+                // and should be cleared once a day)
+      "acquired": 128,
+      "queued": 14886,
+      "oldest": 7539
+    }
+  }
+}
+```
+
+Or queue monitoring is not supported
+(for example internal [lila-fishnet](https://github.com/ornicar/lila-fishnet)):
+
+```
+404 Not found
+```
+
+Key validation
+--------------
+
+```
+GET http://lichess.org/fishnet/key/XXX
+```
+
+Key valid:
+
+```
+200 Ok
+```
+
+Key invalid/inactive:
+
+```
+404 Not found
 ```
